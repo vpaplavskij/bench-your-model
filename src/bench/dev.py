@@ -1,0 +1,304 @@
+"""Developer/coding benchmark: accuracy, runtime errors, total time, ranking.
+
+For each task in :data:`devtasks.DEV_TASKS`:
+  1. ask the model for code (single request),
+  2. extract the Python source,
+  3. run it in a sandboxed namespace and apply the task's deterministic checker,
+  4. record pass/fail, any runtime errors, and total wall time.
+
+A composite score ranks which model best suits developer work:
+    accuracy (pass rate) is primary; runtime-error-free execution and lower
+    total time break ties / add signal.
+"""
+
+from __future__ import annotations
+
+import statistics
+import time
+import types
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+from .client import BenchClient
+from .config import RunConfig
+from .devtasks import DEV_TASKS, extract_code
+from .humanize import fmt_ms, glossary_md, pct
+
+
+# --------------------------------------------------------------------------- #
+# Sandboxed execution
+# --------------------------------------------------------------------------- #
+def run_code(code_src: str) -> dict:
+    """Execute ``code_src`` in a fresh namespace.
+
+    Returns {"ok": bool, "error": str|None, "ns": dict}. Never raises —
+    import/syntax/runtime failures are captured as errors (that's a signal).
+    """
+    ns: dict = {}
+    try:
+        code = compile(code_src, "<devtask>", "exec")
+        exec(code, ns)  # noqa: S102 - deliberate sandbox for benchmarking
+        return {"ok": True, "error": None, "ns": ns}
+    except Exception as e:  # noqa: BLE001 - we WANT to capture every failure
+        return {"ok": False, "error": f"{type(e).__name__}: {e}", "ns": ns}
+
+
+def _load_checker(checker_src: str):
+    """Compile a task's checker source into a callable check(code_src, run)."""
+    ns: dict = {}
+    exec(compile(checker_src, "<checker>", "exec"), ns)  # noqa: S102
+    return ns["check"]
+
+
+# --------------------------------------------------------------------------- #
+# Per-task record
+# --------------------------------------------------------------------------- #
+@dataclass
+class DevTaskResult:
+    task_id: str
+    name: str
+    kind: str
+    request_ok: bool = True
+    request_error: str | None = None
+    code: str = ""
+    passed: bool = False
+    checker_detail: str = ""
+    runtime_error: str | None = None      # error from executing the model's code
+    total_ms: float = 0.0                 # whole task wall time (request + check)
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+
+    @property
+    def status(self) -> str:
+        if not self.request_ok:
+            return "REQUEST-FAIL"
+        if self.runtime_error and not self.passed:
+            return "RUNTIME-ERROR"
+        return "PASS" if self.passed else "FAIL"
+
+
+def _run_dev_task(client: BenchClient, task: dict) -> DevTaskResult:
+    t0 = time.perf_counter()
+    res = client.chat([{"role": "user", "content": task["prompt"]}])
+    rec = DevTaskResult(task_id=task["id"], name=task["name"], kind=task["kind"])
+    if not res.ok:
+        rec.request_ok = False
+        rec.request_error = res.error
+        rec.total_ms = (time.perf_counter() - t0) * 1000
+        return rec
+
+    rec.prompt_tokens = res.prompt_tokens
+    rec.completion_tokens = res.completion_tokens
+    rec.code = extract_code(res.content)
+
+    # Execute the model's code, then apply the deterministic checker.
+    run_res = run_code(rec.code)
+    if not run_res["ok"]:
+        rec.runtime_error = run_res["error"]
+        rec.passed = False
+        rec.checker_detail = f"code failed to import/run: {run_res['error']}"
+    else:
+        check_fn = _load_checker(task["checker_src"])
+        try:
+            outcome = check_fn(rec.code, lambda src: run_code(src))
+            rec.passed = bool(outcome.get("pass"))
+            rec.checker_detail = outcome.get("detail", "")
+        except Exception as e:  # noqa: BLE001 - checker bug shouldn't crash the run
+            rec.passed = False
+            rec.runtime_error = f"checker error: {type(e).__name__}: {e}"
+            rec.checker_detail = rec.runtime_error
+
+    rec.total_ms = (time.perf_counter() - t0) * 1000
+    return rec
+
+
+# --------------------------------------------------------------------------- #
+# Orchestration + scoring
+# --------------------------------------------------------------------------- #
+def run_dev_benchmark(cfg: RunConfig, task_ids: list[str] | None = None) -> dict:
+    client = BenchClient(
+        endpoint=cfg.endpoint, model=cfg.model, api_key=cfg.api_key,
+        timeout_s=cfg.timeout_s, max_tokens=cfg.max_tokens, temperature=0.0,
+    )
+    server_info: dict = {"endpoint": cfg.endpoint, "model_available": False}
+    try:
+        available = client.list_models()
+        server_info["available_models"] = available
+        server_info["model_available"] = cfg.model in available
+    except Exception as e:
+        server_info["error"] = f"{type(e).__name__}: {e}"
+
+    tasks = [t for t in DEV_TASKS if not task_ids or t["id"] in (task_ids or [])]
+    records: list[DevTaskResult] = []
+    print(f"Running {len(tasks)} dev task(s) against {cfg.endpoint} (model={cfg.model})")
+    for task in tasks:
+        rec = _run_dev_task(client, task)
+        records.append(rec)
+        extra = ""
+        if rec.runtime_error:
+            extra = f" | runtime-error: {rec.runtime_error[:60]}"
+        print(f"  [{rec.status}] {task['id']} {task['name']}: "
+              f"{round(rec.total_ms)}ms{extra}")
+
+    client.close()
+    return _assemble(cfg, server_info, records)
+
+
+def _med(vals: list) -> float | None:
+    vals = [v for v in vals if v is not None]
+    return round(statistics.median(vals), 1) if vals else None
+
+
+def composite_score(records: list[DevTaskResult]) -> float:
+    """0-100 developer-suitability score.
+
+    accuracy (pass rate) * 100, minus a small penalty per runtime error and
+    per timeout/failure-to-execute, so a model that passes everything but
+    crashes on one task ranks below a clean one.
+    """
+    n = len(records)
+    if n == 0:
+        return 0.0
+    passed = sum(1 for r in records if r.passed)
+    accuracy_pts = (passed / n) * 100.0
+    runtime_errors = sum(1 for r in records if r.runtime_error and not r.passed)
+    request_fails = sum(1 for r in records if not r.request_ok)
+    penalty = 5.0 * runtime_errors + 10.0 * request_fails
+    return max(0.0, round(accuracy_pts - penalty, 1))
+
+
+def _assemble(cfg: RunConfig, server_info: dict, records: list[DevTaskResult]) -> dict:
+    n = len(records)
+    passed = sum(1 for r in records if r.passed)
+    runtime_errors = [r for r in records if r.runtime_error and not r.passed]
+    request_fails = [r for r in records if not r.request_ok]
+    total_ms_all = [r.total_ms for r in records]
+
+    # Breakdown by task kind (which dev skill is strongest/weakest).
+    by_kind: dict[str, dict] = {}
+    for r in records:
+        k = by_kind.setdefault(r.kind, {"n": 0, "passed": 0})
+        k["n"] += 1
+        k["passed"] += 1 if r.passed else 0
+    for v in by_kind.values():
+        v["accuracy"] = round(v["passed"] / v["n"], 3) if v["n"] else None
+
+    error_log = [
+        {"task_id": r.task_id, "kind": r.kind, "error": r.runtime_error}
+        for r in runtime_errors
+    ] + [
+        {"task_id": r.task_id, "kind": r.kind, "error": f"request failed: {r.request_error}"}
+        for r in request_fails
+    ]
+
+    return {
+        "meta": {
+            "kind": "dev",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "model": cfg.model,
+            "endpoint": cfg.endpoint,
+            "temperature": cfg.temperature,
+            "max_tokens": cfg.max_tokens,
+            # How the SERVER serves the model (Unsloth Studio / llama.cpp), not
+            # the agent harness. See REPORT_SPEC.md.
+            "settings": cfg.settings(),
+        },
+        "server": server_info,
+        "tasks": [
+            {
+                "task_id": r.task_id, "name": r.name, "kind": r.kind,
+                "status": r.status, "passed": r.passed,
+                "checker_detail": r.checker_detail,
+                "runtime_error": r.runtime_error,
+                "request_error": r.request_error,
+                "total_ms": round(r.total_ms, 1),
+                "prompt_tokens": r.prompt_tokens,
+                "completion_tokens": r.completion_tokens,
+                "code": r.code,
+            }
+            for r in records
+        ],
+        "summary": {
+            "n_tasks": n,
+            "passed": passed,
+            "accuracy": round(passed / n, 3) if n else None,
+            "runtime_errors": len(runtime_errors),
+            "request_failures": len(request_fails),
+            "total_execution_ms": {
+                "mean": round(sum(total_ms_all) / len(total_ms_all), 1) if total_ms_all else None,
+                "median": _med(total_ms_all),
+                "max": round(max(total_ms_all), 1) if total_ms_all else None,
+            },
+            "by_kind_accuracy": by_kind,
+            "composite_score": composite_score(records),
+        },
+        "error_log": error_log,
+    }
+
+
+def render_dev_markdown(doc: dict) -> str:
+    s = doc["summary"]
+    m = doc["meta"]
+
+    plain: list[str] = [
+        f"- Gave it {s['n_tasks']} real coding jobs (write, fix, refactor, build). "
+        f"It finished them all and we ran its code to check the work."
+    ]
+    if s["passed"] == s["n_tasks"]:
+        plain.append(f"- **All {s['passed']}/{s['n_tasks']} jobs passed** — every program it wrote actually works.")
+    else:
+        plain.append(f"- **{s['passed']}/{s['n_tasks']} jobs passed.** "
+                     f"{'One job' if s['n_tasks'] - s['passed'] == 1 else 'Some jobs'} did not work out — see below.")
+    if s["runtime_errors"]:
+        n = s["runtime_errors"]
+        plain.append(f"- {n} of its programs **crashed when we ran them** — "
+                     f"the code it wrote has a bug in it.")
+    if s["request_failures"]:
+        plain.append(f"- {s['request_failures']} request(s) never even got an answer back.")
+    plain.append(f"- A typical job took **{fmt_ms(s['total_execution_ms']['median'])}** from prompt to finished, working code.")
+    _d_total = sum(t["total_ms"] for t in doc["tasks"] if t.get("total_ms") is not None)
+    if _d_total > 0:
+        plain.append(f"- **Total execution time** (all {s['n_tasks']} jobs): **{fmt_ms(_d_total)}**.")
+    plain.append(f"- Overall dev-suitability score: **{s['composite_score']}/100** "
+                 "(mix of pass rate and how clean the code ran).")
+
+    lines = [
+        f"# Developer-task benchmark — `{m['model']}`",
+        "",
+        f"_endpoint: `{m['endpoint']}`  ·  date: {m['timestamp']}_",
+        "",
+        "## In plain words",
+        *plain,
+        "",
+        "## The jobs",
+        "",
+        "| job | what it tests | result | took | what happened |",
+        "|---|---|---|---|---|",
+    ]
+    for t in doc["tasks"]:
+        status = t["status"]
+        if status == "PASS":
+            res = "✓ passed"
+        elif status == "RUNTIME-ERROR":
+            res = "💥 crashed at runtime"
+        elif status == "REQUEST-FAIL":
+            res = "⚠ no answer received"
+        else:
+            res = "✗ failed checks"
+        lines.append(
+            f"| {t['task_id']} — {t.get('name', '')} | {t['kind']} | {res} "
+            f"| {fmt_ms(t['total_ms'])} | {t['checker_detail'][:80]} |"
+        )
+    if s["by_kind_accuracy"]:
+        lines += ["", "## Accuracy by skill", ""]
+        for kind, v in s["by_kind_accuracy"].items():
+            lines.append(f"- **{kind}**: {v['passed']}/{v['n']} passed ({pct(v['accuracy'])})")
+    if doc["error_log"]:
+        lines += ["", "## What went wrong (error log)", ""]
+        for e in doc["error_log"]:
+            lines.append(f"- `{e['task_id']}` ({e['kind']}): {e['error']}")
+    else:
+        lines += ["", "## What went wrong (error log)", "", "- none — every task ran and was scored cleanly"]
+    lines += glossary_md()
+    return "\n".join(lines) + "\n"
