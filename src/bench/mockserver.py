@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -271,6 +272,13 @@ def _detect(messages: list[dict], body: dict) -> str | None:
 
 class _Handler(BaseHTTPRequestHandler):
     model_name: str = "mock-model"
+    # Failure/thinking modes (0 = disabled, default behavior unchanged).
+    # Set as class attributes by serve(), same pattern as model_name.
+    think_tokens: int = 0
+    http_error_every: int = 0
+    sse_error_every: int = 0
+    req_no: int = 0
+    _req_lock = threading.Lock()
 
     def log_message(self, fmt, *args):  # keep stdout clean
         pass
@@ -416,6 +424,13 @@ class _Handler(BaseHTTPRequestHandler):
         if not self.path.rstrip("/").endswith("/chat/completions"):
             self._json({"error": "not found"}, 404)
             return
+        cls = type(self)
+        with cls._req_lock:
+            cls.req_no += 1
+            req_no = cls.req_no
+        if cls.http_error_every and req_no % cls.http_error_every == 0:
+            self._json({"error": "mock http error"}, 500)
+            return
         n = int(self.headers.get("Content-Length", 0))
         try:
             body = json.loads(self.rfile.read(n) or b"{}")
@@ -490,10 +505,47 @@ class _Handler(BaseHTTPRequestHandler):
         prefill_s = min(0.15 + n_prompt_words * 0.004, 3.0)  # ~ms per prompt word
         time.sleep(prefill_s)
 
+        # --sse-error-every: HTTP 200, a few chunks, then an in-stream error
+        # chunk (llama.cpp does exactly this) followed by [DONE].
+        if cls.sse_error_every and req_no % cls.sse_error_every == 0:
+            for tok in ("par ", "tial "):
+                chunk = {
+                    "id": "chatcmpl-mock", "object": "chat.completion.chunk",
+                    "model": self.model_name,
+                    "choices": [{"index": 0, "delta": {"content": tok},
+                                  "finish_reason": None}],
+                }
+                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                self.wfile.flush()
+                time.sleep(0.01)
+            self.wfile.write(
+                f"data: {json.dumps({'error': {'message': 'boom'}})}\n\n".encode())
+            self.wfile.flush()
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            return
+
+        # --think-tokens: stream reasoning_content before the answer, like
+        # llama.cpp. The max_tokens cap covers reasoning + content, so content
+        # gets only the remaining budget; if reasoning spent the whole cap
+        # there is no content at all and the finish reason is "length".
+        n_reason = min(cls.think_tokens, max_tokens) if cls.think_tokens else 0
+        budget_left = max_tokens - n_reason
+        for _ in range(n_reason):
+            chunk = {
+                "id": "chatcmpl-mock", "object": "chat.completion.chunk",
+                "model": self.model_name,
+                "choices": [{"index": 0, "delta": {"reasoning_content": "hmm "},
+                              "finish_reason": None}],
+            }
+            self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+            self.wfile.flush()
+            time.sleep(0.01)
+
         if tool_calls:
             # Native tool-call stream: one chunk carrying the full call(s),
             # mirroring how llama.cpp emits function calls in a single delta.
-            completion_tokens = sum(1 + len(tc["arguments"]) for tc in tool_calls)
+            completion_tokens = n_reason + sum(1 + len(tc["arguments"]) for tc in tool_calls)
             tc_deltas = [
                 {"index": i, "id": f"call_{i}", "type": "function",
                  "function": {"name": tc["name"],
@@ -513,7 +565,9 @@ class _Handler(BaseHTTPRequestHandler):
             # Tokenize like a real server: each chunk carries its own whitespace
             # so concatenating delta contents reproduces the original text exactly.
             tokens = re.findall(r"\S+\s*|\s+", text) or [""]
-            completion_tokens = len(tokens)
+            if cls.think_tokens:
+                tokens = tokens[:budget_left]
+            completion_tokens = n_reason + len(tokens)
             for tok in tokens[:max_tokens]:
                 delta = {"role": "assistant", "content": tok}
                 chunk = {
@@ -526,10 +580,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
                 time.sleep(0.01)  # ~100 tok/s decode
 
+        finish = ("length" if cls.think_tokens and completion_tokens >= max_tokens
+                  else finish_reason)
         final = {
             "id": "chatcmpl-mock", "object": "chat.completion.chunk",
             "model": self.model_name,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
             "usage": {"prompt_tokens": n_prompt_words,
                       "completion_tokens": completion_tokens,
                       "total_tokens": n_prompt_words + completion_tokens},
@@ -540,8 +596,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
-def serve(port: int = 8080, model: str = "mock-model") -> None:
-    handler = type("H", (_Handler,), {"model_name": model})
+def serve(port: int = 8080, model: str = "mock-model", think_tokens: int = 0,
+          http_error_every: int = 0, sse_error_every: int = 0) -> None:
+    handler = type("H", (_Handler,), {"model_name": model, "think_tokens": think_tokens,
+                                      "http_error_every": http_error_every,
+                                      "sse_error_every": sse_error_every})
     httpd = ThreadingHTTPServer(("127.0.0.1", port), handler)
     print(f"mock OpenAI server on http://127.0.0.1:{port}/v1  (model: {model!r})")
     try:
@@ -556,8 +615,15 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="bench mock", description=__doc__.splitlines()[0])
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--model", default="mock-model")
+    p.add_argument("--think-tokens", type=int, default=0,
+                   help="stream N reasoning_content chunks before the answer (0 = off)")
+    p.add_argument("--http-error-every", type=int, default=0,
+                   help="return HTTP 500 on every Nth chat request (0 = off)")
+    p.add_argument("--sse-error-every", type=int, default=0,
+                   help="send an in-stream error chunk on every Nth streaming request (0 = off)")
     args = p.parse_args(argv)
-    serve(port=args.port, model=args.model)
+    serve(port=args.port, model=args.model, think_tokens=args.think_tokens,
+          http_error_every=args.http_error_every, sse_error_every=args.sse_error_every)
     return 0
 
 
