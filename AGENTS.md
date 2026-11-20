@@ -16,7 +16,11 @@ uv run bench all --model <name> --endpoint http://localhost:8080/v1 \
 - Subcommands: `quality` (default when no subcommand given), `perf`, `dev`, `all`, `mock`.
 - Smoke test without a model: `uv run bench mock --port 8090 --model mock-model` (stdlib-only mock OpenAI server). Point a `bench all` run at it to verify plumbing (SSE parsing, scoring, result folders).
 - The mock's answers are keyed on prompt substrings in `mockserver._detect`; unmatched prompts get a `tok tok…` filler that scores/fails. A full `bench mock` smoke run passes 11/11 structured (agent tasks s4/a1–a5 are driven conversationally) and 13/13 dev; o1–o3 are judge-scored from a canned rubric answer.
-- **No test suite, linter, or CI.** Verify changes by running `bench all` against `bench mock`.
+- Test suite: `uv run pytest` (full, ~60 s incl. the slow dev-timeout test) or
+  `uv run pytest -m "not slow"` for the quick set (what CI runs on push/PR; a
+  nightly job runs `-m slow`). Tests live in `tests/` and drive the mock server
+  on a free port. Still verify end-to-end with `bench all` against `bench mock`.
+  No linter.
 
 ## Results layout (gitignored, never overwritten)
 

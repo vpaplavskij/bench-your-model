@@ -7,6 +7,15 @@ dependencies = [
     "httpx>=0.27",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: long-running tests (skipped by `pytest -m 'not slow'`)"]
+
 [project.scripts]
 bench = "bench.cli:main"
 
