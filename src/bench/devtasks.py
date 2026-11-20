@@ -623,9 +623,15 @@ def extract_code(text: str) -> str:
     m = re.search(r"```(?:python|py)?\s*\n(.*?)```", text, re.DOTALL)
     if m:
         return m.group(1).strip()
-    # Otherwise, if the whole thing looks like code (has a def/def-like line), use it.
+    # Otherwise, if the whole thing looks like code (has a def/def-like line),
+    # drop leading/trailing prose lines so exec() only sees code.
     if re.search(r"^\s*(def |class |\w+\s*=\s*lambda)", text, re.MULTILINE):
-        # Strip any leading/trailing prose lines that are clearly not code.
+        code_line = re.compile(r"^\s*(def |class |import |from |@|return |if |for |while |\w+\s*=)")
+        lines = text.splitlines()
+        # A line is "code" if it looks like a statement or is indented (block body).
+        idx = [i for i, ln in enumerate(lines) if code_line.match(ln) or ln[:1] in (" ", "\t")]
+        if idx:
+            return "\n".join(lines[idx[0]:idx[-1] + 1]).strip()
         return text
     # Last resort: first fenced block of any language.
     m = re.search(r"```[a-z]*\s*\n(.*?)```", text, re.DOTALL)

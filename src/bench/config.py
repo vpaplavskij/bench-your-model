@@ -24,13 +24,11 @@ class RunConfig:
     endpoint: str = "http://localhost:8080/v1"
     model: str = ""
     api_key: str = "none"
-    concurrency: int = 4
     timeout_s: float = 300.0
     max_tokens: int = 4096
     temperature: float = 0.0
     judge_model: str | None = None
     suite: str = "all"  # "structured" | "open" | "all"
-    out_dir: str = "results"
     root: str = "results"  # results live under <root>/<model>/
     task_ids: list[str] = field(default_factory=list)  # empty = all tasks
 
@@ -90,8 +88,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", required=True,
                    help="Model name to send in requests (see /v1/models)")
     p.add_argument("--api-key", default=os.environ.get("BENCH_API_KEY", "none"))
-    p.add_argument("--concurrency", type=int, default=4,
-                   help="Max parallel requests (default: 4)")
     p.add_argument("--timeout", type=float, default=300.0,
                    help="Per-request timeout in seconds (default: 300)")
     p.add_argument("--max-tokens", type=int, default=4096)
@@ -101,7 +97,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--suite", choices=["structured", "agent", "open", "all"], default="all")
     p.add_argument("--task", action="append", default=[], metavar="ID",
                    help="Run only specific task IDs (repeatable), e.g. --task s1 --task o2")
-    p.add_argument("--out-dir", default="results")
     p.add_argument("--root", default="results",
                    help="Results root; results live under <root>/<model>/ (default: ./results)")
     add_settings_args(p)
@@ -114,13 +109,11 @@ def parse_args(argv: list[str] | None = None) -> RunConfig:
         endpoint=args.endpoint,
         model=args.model,
         api_key=args.api_key,
-        concurrency=args.concurrency,
         timeout_s=args.timeout,
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         judge_model=args.judge_model,
         suite=args.suite,
-        out_dir=args.out_dir,
         root=args.root,
         task_ids=list(args.task),
         quant=args.quant,

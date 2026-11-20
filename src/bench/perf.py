@@ -94,9 +94,11 @@ def _time_request(client: BenchClient, prompt: str, max_tokens: int) -> PerfRun:
         run.itl_p95_ms = sm.p95_itl_ms()
         run.itl_max_ms = sm.max_itl_ms()
         run.stalls = sm.stall_count_ms()
-    # Derived speeds (guard: need >=2 tokens for a decode span)
+    # Derived speeds (guard: need >=2 tokens for a decode span).
+    # Decode counts CONTENT chunks only — usage completion_tokens include
+    # thinking tokens and would inflate decode_tps on thinking servers.
     if res.ttft_ms and res.total_ms > res.ttft_ms:
-        n = res.completion_tokens or 0
+        n = res.stream_chunks
         if n >= 2:
             run.decode_tps = (n - 1) / ((res.total_ms - res.ttft_ms) / 1000.0)
         if res.prompt_tokens:
@@ -335,10 +337,13 @@ def render_perf_markdown(doc: dict) -> str:
         "|---|---|---|---|---|---|---|",
     ]
     for p in doc["points"]:
+        # The filler is ~1 token/word, so show the server's real prompt count when known.
+        size = (f"{p['actual_prompt_tokens']} tok" if p["actual_prompt_tokens"]
+                else f"~{p['prompt_size']} words")
         lines.append(
-            f"| ~{p['prompt_size']} words | {fmt_ms(p['ttft_ms']['median'])} "
+            f"| {size} | {fmt_ms(p['ttft_ms']['median'])} "
             f"| {fmt_tps(p['prefill_tps']['median'])} | {fmt_tps(p['decode_tps']['median'])} "
-            f"| {p['itl_mean_ms']['median']:.0f} / {p['itl_p95_ms']:.0f} ms "
+            f"| {fmt_ms(p['itl_mean_ms']['median'])} / {fmt_ms(p['itl_p95_ms'])} "
             f"| {fmt_ms(p['total_ms']['median'])} | {p['stalls_total']} |"
         )
     lines += ["", "## What's slowing it down (diagnosis)", ""]

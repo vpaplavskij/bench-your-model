@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import json
 import statistics
+import sys
 import time
-from dataclasses import asdict
 from datetime import datetime, timezone
-from pathlib import Path
 
 from .client import BenchClient
 from .config import RunConfig
@@ -43,6 +42,9 @@ def run_benchmark(cfg: RunConfig) -> dict:
     tasks = [t for t in tasks_for_suite(cfg.suite) if not cfg.task_ids or t["id"] in cfg.task_ids]
     records: list[dict] = []
     judge_model = cfg.resolve_judge()
+    if judge_model == cfg.model:
+        print("WARNING: LLM judge = model under test (self-assessment). Pass --judge-model "
+              "to score open tasks with a different model.", file=sys.stderr)
 
     print(f"Running {len(tasks)} task(s) against {cfg.endpoint} (model={cfg.model})")
     for task in tasks:
@@ -93,6 +95,8 @@ def _run_agent_task(client: BenchClient, cfg: RunConfig, task: dict) -> dict:
     env = task["env_factory"]()
     max_steps = int(task.get("max_steps", 8))
     all_calls: list[dict] = []
+    comp_tokens = 0
+    call_seq = 1  # tool_call ids must stay unique across turns (strict servers reject dupes)
     t_start = time.perf_counter()
     first_ttft: float | None = None
     content: str | None = None
@@ -106,6 +110,7 @@ def _run_agent_task(client: BenchClient, cfg: RunConfig, task: dict) -> dict:
             return rec
         if first_ttft is None and res.ttft_ms is not None:
             first_ttft = res.ttft_ms
+        comp_tokens += res.stream_chunks or res.completion_tokens or 0
 
         calls = list(res.tool_calls or [])
         if not calls:
@@ -114,7 +119,9 @@ def _run_agent_task(client: BenchClient, cfg: RunConfig, task: dict) -> dict:
             break
 
         all_calls.extend(calls)
-        for i, call in enumerate(calls):
+        for call in calls:
+            call_id = f"call_{call_seq}"
+            call_seq += 1
             name = call.get("name", "")
             args = call.get("arguments") or {}
             if not isinstance(args, dict):
@@ -128,14 +135,14 @@ def _run_agent_task(client: BenchClient, cfg: RunConfig, task: dict) -> dict:
                 "role": "assistant",
                 "content": None,
                 "tool_calls": [{
-                    "id": f"call_{i}",
+                    "id": call_id,
                     "type": "function",
                     "function": {"name": name, "arguments": json.dumps(args)},
                 }],
             })
             messages.append({
                 "role": "tool",
-                "tool_call_id": f"call_{i}",
+                "tool_call_id": call_id,
                 "content": json.dumps(result),
             })
 
@@ -146,7 +153,7 @@ def _run_agent_task(client: BenchClient, cfg: RunConfig, task: dict) -> dict:
     rec["tool_calls"] = all_calls or None
     rec["ttft_ms"] = first_ttft
     rec["total_ms"] = (time.perf_counter() - t_start) * 1000.0
-    rec["completion_tokens"] = len(all_calls)
+    rec["completion_tokens"] = comp_tokens
 
     if content is not None:
         # Normal completion — score it.
@@ -154,7 +161,8 @@ def _run_agent_task(client: BenchClient, cfg: RunConfig, task: dict) -> dict:
             ok = bool(task["check"](env, content))
         except Exception as e:
             ok = False
-            detail = f"checker error: {e}"
+            rec["checker_error"] = f"checker error (harness): {type(e).__name__}: {e}"
+            detail = rec["checker_error"]
         else:
             detail = (
                 "agent workflow completed: final answer + environment state verified"
@@ -222,7 +230,8 @@ def _run_task(client: BenchClient, cfg: RunConfig, task: dict, judge_model: str)
 
 def _assemble(cfg: RunConfig, server_info: dict, records: list[dict]) -> dict:
     ok_reqs = [r for r in records if r["request_ok"]]
-    structured = [r for r in ok_reqs if r["suite"] == "structured"]
+    # Harness checker bugs are not the model's: excluded from accuracy scoring.
+    structured = [r for r in ok_reqs if r["suite"] == "structured" and not r.get("checker_error")]
     open_tasks = [r for r in ok_reqs if r["suite"] == "open"]
 
     def _ms(vals: list) -> dict:
@@ -251,7 +260,6 @@ def _assemble(cfg: RunConfig, server_info: dict, records: list[dict]) -> dict:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "endpoint": cfg.endpoint,
             "model": cfg.model,
-            "concurrency": cfg.concurrency,
             "temperature": cfg.temperature,
             "max_tokens": cfg.max_tokens,
             "suite": cfg.suite,
@@ -273,19 +281,10 @@ def _assemble(cfg: RunConfig, server_info: dict, records: list[dict]) -> dict:
                 "correct": correct,
                 "accuracy": round(correct / n_struct, 3) if n_struct else None,
             },
+            "checker_errors": sum(1 for r in records if r.get("checker_error")),
             "judge_dimension_means": judge_means or None,
         },
     }
-
-
-def write_results(doc: dict, out_dir: str) -> tuple[Path, Path]:
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    json_path = out / "results.json"
-    md_path = out / "summary.md"
-    json_path.write_text(json.dumps(doc, indent=2))
-    md_path.write_text(render_markdown(doc))
-    return json_path, md_path
 
 
 def render_markdown(doc: dict) -> str:

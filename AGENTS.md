@@ -1,7 +1,8 @@
 # AGENTS.md — bench-your-model
 
 Benchmark harness for local LLM servers exposing an OpenAI-compatible API.
-Single Python package `src/bench/` (uv, Python ≥3.10, deps: httpx + pydantic).
+Single Python package `src/bench/` (uv, Python ≥3.10, deps: httpx). Linux only —
+the `dev` exec timeout uses SIGALRM, which macOS/Windows don't have.
 
 ## Commands
 
@@ -13,7 +14,8 @@ uv run bench all --model <name> --endpoint http://localhost:8080/v1 \
 
 - `bench all` runs **quality → perf → dev** back-to-back into ONE run folder. It is the only command you normally need.
 - Subcommands: `quality` (default when no subcommand given), `perf`, `dev`, `all`, `mock`.
-- Smoke test without a model: `uv run bench mock --port 8090 --model mock-model` (stdlib-only mock OpenAI server; streams checker-passing answers for every task). Point a `bench all` run at it to verify plumbing (SSE parsing, scoring, result folders).
+- Smoke test without a model: `uv run bench mock --port 8090 --model mock-model` (stdlib-only mock OpenAI server). Point a `bench all` run at it to verify plumbing (SSE parsing, scoring, result folders).
+- The mock's answers are keyed on prompt substrings in `mockserver._detect`; unmatched prompts get a `tok tok…` filler that scores/fails. A full `bench mock` smoke run passes 11/11 structured (agent tasks s4/a1–a5 are driven conversationally) and 13/13 dev; o1–o3 are judge-scored from a canned rubric answer.
 - **No test suite, linter, or CI.** Verify changes by running `bench all` against `bench mock`.
 
 ## Results layout (gitignored, never overwritten)
@@ -48,6 +50,7 @@ results/<MODEL>-<QUANT>/<run-ts>/    # <run-ts> = UTC timestamp; re-runs append
 - Quality task kinds: `tools` (native function calling, scored exactly; falls back to parsing `{"tool_calls": [...]}` from text if the server lacks native support), `agent` (multi-turn: harness drives the tool loop against `task["env_factory"]()` env, scored on final answer AND terminal env state), structured/open (JSON schema + exact match / LLM-judge rubric).
 - Dev tasks need a `prompt` + `checker_src` string defining `check(code_src, run) -> {"pass": bool, "detail": str}`.
 - **Keep task ids and names stable** so historical cross-run comparisons stay valid — fix tasks in place, don't renumber.
+- Prompt wording is load-bearing for the mock: `_detect` matches substrings like `"17 * 23"`, `"shelves"`, `"book a flight"`, `"gains 5 minutes every day"`, `"train ride costs"`, `"Great Barrier Reef"`, `"exactly 5 benefits"`, `"delayed by one week"`, dev function names. Editing a prompt (or its checker) silently breaks `bench mock` for that task.
 
 ## Docs hierarchy (read before acting)
 
@@ -57,7 +60,12 @@ results/<MODEL>-<QUANT>/<run-ts>/    # <run-ts> = UTC timestamp; re-runs append
 
 ## Gotchas
 
+- `--endpoint` must include `/v1` — `client.py` POSTs `/chat/completions` directly to it.
+- Dead flags: none — `--concurrency` and `--out-dir` were removed (tasks run sequentially; folder is `--root`-based). `BENCH_ENDPOINT` / `BENCH_API_KEY` env vars are read by all subcommand parsers.
+- `--temperature` applies to `quality` only — `dev`/`perf` clients hardcode `0.0` (the `dev` parser no longer accepts the flag).
+- perf/quality token counting only looks at `delta.content` (content chunks ≈ content tokens), so server-side thinking tokens are excluded from ITL / decode tok/s / writing speed. `completion_tokens` in the json still carries the server `usage` value, thinking included. Agent tasks sum content chunks across turns (older runs recorded the tool-call *count* there — not comparable).
+- Exit codes are 0 even when tasks fail or hit runtime errors — only request/connection errors abort; failed tasks print a stderr WARNING. Read the `*.json`, not the exit code.
 - `bench all` / `bench dev` take ~5–10 min against a real model; run in background, don't poll.
-- The dev harness executes model code in a plain `exec` namespace (no network, no filesystem sandbox) — fine for trusted local models, **do not point it at untrusted remote endpoints**.
+- The dev harness executes model code in a guarded `exec` namespace (imports of fs/net/subprocess modules — os, sys, socket, subprocess, shutil, tempfile, pathlib, urllib, … — and `open()` are blocked; json/re/math/collections/itertools stay available). Fine for trusted local models, **do not point it at untrusted remote endpoints**.
 - Don't kill processes on the machine while benchmarking (llama-server / Unsloth Studio / mock servers may be running).
 - Prompt sizes in perf are approximate (~1 token/word filler); actual counts come from server `usage`.

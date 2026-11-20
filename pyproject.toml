@@ -5,7 +5,6 @@ description = "Benchmark harness for local LLM servers (OpenAI-compatible API)"
 requires-python = ">=3.10"
 dependencies = [
     "httpx>=0.27",
-    "pydantic>=2.5",
 ]
 
 [project.scripts]

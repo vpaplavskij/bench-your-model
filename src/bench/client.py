@@ -27,9 +27,13 @@ class ChatResult:
 
     @property
     def tokens_per_s(self) -> float | None:
-        if self.completion_tokens is None or not self.total_ms:
+        # Content chunks ≈ content tokens. `usage` completion_tokens includes
+        # server-side thinking: tool-call-only answers must NOT report a speed
+        # built from thinking tokens (AGENTS.md gotcha).
+        n = self.stream_chunks
+        if not n or not self.total_ms:
             return None
-        return self.completion_tokens / (self.total_ms / 1000.0)
+        return n / (self.total_ms / 1000.0)
 
 
 @dataclass
@@ -82,20 +86,6 @@ class StreamMetrics:
             1 for a, b in zip(self.samples, self.samples[1:])
             if (b.t - a.t) * 1000.0 > threshold_ms
         )
-
-    def generation_span_ms(self) -> float | None:
-        """Time from first to last token arrival."""
-        if len(self.samples) < 2:
-            return None
-        return (self.samples[-1].t - self.samples[0].t) * 1000.0
-
-    def effective_tps(self, ttft_s: float | None, total_s: float) -> float | None:
-        """Tokens/s over the generation span only (excludes prefill/TTFT)."""
-        span = self.generation_span_ms()
-        if not span or len(self.samples) < 2:
-            return None
-        n = len(self.samples) - 1  # tokens generated after the first one
-        return n / (span / 1000.0)
 
 
 def _merge_tool_call(index: dict[int, dict], tc: dict) -> None:
@@ -264,7 +254,12 @@ class BenchClient:
                         samples.append(StreamSample(t=now))
                         pieces.append(token)
                         res.stream_chunks += 1
-                    for tc in delta.get("tool_calls") or []:
+                    tc_deltas = delta.get("tool_calls") or []
+                    if tc_deltas and first_token_at is None:
+                        # A tool-call delta IS the first token; TTFT must count
+                        # it or tool-only answers record ttft=None (seen on s3).
+                        first_token_at = now
+                    for tc in tc_deltas:
                         _merge_tool_call(tc_index, tc)
                     usage = chunk.get("usage")
                     if usage:

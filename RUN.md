@@ -59,6 +59,7 @@ the harness prints its path when it finishes.
 | `results/<MODEL>-<QUANT>/<run-folder>/quality.md` | **Read this one.** Per-question detail (which quiz items were right/wrong and why) + the standard's total execution time. |
 | `results/<MODEL>-<QUANT>/<run-folder>/perf.md` | **Read this one.** Speed per prompt length + bottleneck diagnosis + total execution time. |
 | `results/<MODEL>-<QUANT>/<run-folder>/dev.md` | **Read this one.** Which coding jobs passed/crashed and why + total execution time. |
+| `results/<MODEL>-<QUANT>/<run-folder>/compare.md` | **Read this one.** This run vs every previously recorded run (same model, and best comparable run per model+quant). `†` rows used a different suite size; `⚠` rows ran with no thinking. |
 
 The `.json` files next to each `.md` hold the same data in machine form; you need them only for the server settings (`meta.settings`, see step 4) or raw numbers.
 
@@ -68,7 +69,9 @@ First state **Model & settings**: read `meta.settings` from any of the run's
 `*.json` files (quantization, reasoning level/budget, preserve thinking, context
 length) and pair it with the model name and endpoint. Then give one line per
 standard (quality / perf / dev) with the headline numbers from each `.md`, then
-each standard's **Total execution time** line, plus the run folder path.
+each standard's **Total execution time** line, plus the run folder path. Finish with
+the comparison from `compare.md`: how this run ranks against the recorded runs (speed
+and correctness), noting any `†`/`⚠` caveats.
 
 ## What NOT to do
 

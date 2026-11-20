@@ -13,6 +13,7 @@ A composite score ranks which model best suits developer work:
 
 from __future__ import annotations
 
+import signal
 import statistics
 import time
 import types
@@ -29,17 +30,63 @@ from .humanize import fmt_ms, glossary_md, pct
 # --------------------------------------------------------------------------- #
 # Sandboxed execution
 # --------------------------------------------------------------------------- #
+# Top-level modules blocked in the exec namespace: fs/net/subprocess access.
+# The dev tasks and their checkers only need json/re/math/collections/itertools.
+# shortcut: blocks imports + open(), not attribute-level escapes (e.g. builtins
+# reached via gc); upgrade to a real sandbox if the harness ever faces remote servers.
+_BLOCKED_MODULES = frozenset({"os", "sys", "socket", "subprocess", "shutil", "tempfile",
+                              "http", "urllib", "pathlib", "ctypes", "pty", "signal",
+                              "multiprocessing", "threading"})
+
+# SIGALRM guard (Linux, single-threaded main loop): an infinite loop in
+# model-written code would otherwise hang the whole bench run forever.
+_DEV_EXEC_TIMEOUT_S = 15.0
+
+
+class _ExecTimeout(BaseException):
+    """BaseException on purpose: model code doing `except Exception:` cannot swallow it."""
+
+
+def _alarm_handler(signum, frame):
+    raise _ExecTimeout(f"dev exec timed out after {int(_DEV_EXEC_TIMEOUT_S)}s (infinite loop?)")
+
+
+def _safe_builtins() -> dict:
+    import builtins
+    bi = dict(builtins.__dict__)
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.split(".")[0] in _BLOCKED_MODULES:
+            raise ImportError(f"'{name}' is blocked in the dev sandbox (no fs/net/subprocess)")
+        return builtins.__import__(name, globals, locals, fromlist, level)
+
+    bi["__import__"] = guarded_import
+    bi.pop("open", None)
+    return bi
+
+
 def run_code(code_src: str) -> dict:
     """Execute ``code_src`` in a fresh namespace.
 
     Returns {"ok": bool, "error": str|None, "ns": dict}. Never raises —
     import/syntax/runtime failures are captured as errors (that's a signal).
     """
-    ns: dict = {}
+    ns: dict = {"__builtins__": _safe_builtins()}
     try:
         code = compile(code_src, "<devtask>", "exec")
-        exec(code, ns)  # noqa: S102 - deliberate sandbox for benchmarking
+        signal.signal(signal.SIGALRM, _alarm_handler)
+        # Repeating interval: a bare `except:` that swallows one alarm cannot
+        # finish the task; code keeps getting interrupted until exec returns.
+        # shortcut: code that catches every exception forever is unkillable
+        # in-process — upgrade to a subprocess watchdog if that ever matters.
+        signal.setitimer(signal.ITIMER_REAL, _DEV_EXEC_TIMEOUT_S, _DEV_EXEC_TIMEOUT_S)
+        try:
+            exec(code, ns)  # noqa: S102 - deliberate sandbox for benchmarking
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
         return {"ok": True, "error": None, "ns": ns}
+    except _ExecTimeout as e:  # noqa: BLE001 - a hang is a scored signal, not a crash
+        return {"ok": False, "error": str(e), "ns": ns}
     except Exception as e:  # noqa: BLE001 - we WANT to capture every failure
         return {"ok": False, "error": f"{type(e).__name__}: {e}", "ns": ns}
 
@@ -65,6 +112,7 @@ class DevTaskResult:
     passed: bool = False
     checker_detail: str = ""
     runtime_error: str | None = None      # error from executing the model's code
+    checker_error: str | None = None      # harness checker bug — never penalizes the model
     total_ms: float = 0.0                 # whole task wall time (request + check)
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
@@ -75,6 +123,8 @@ class DevTaskResult:
             return "REQUEST-FAIL"
         if self.runtime_error and not self.passed:
             return "RUNTIME-ERROR"
+        if self.checker_error:
+            return "CHECKER-ERROR"  # harness bug — task not scored
         return "PASS" if self.passed else "FAIL"
 
 
@@ -104,10 +154,10 @@ def _run_dev_task(client: BenchClient, task: dict) -> DevTaskResult:
             outcome = check_fn(rec.code, lambda src: run_code(src))
             rec.passed = bool(outcome.get("pass"))
             rec.checker_detail = outcome.get("detail", "")
-        except Exception as e:  # noqa: BLE001 - checker bug shouldn't crash the run
+        except Exception as e:  # noqa: BLE001 - checker bug shouldn't crash the run or the model's score
             rec.passed = False
-            rec.runtime_error = f"checker error: {type(e).__name__}: {e}"
-            rec.checker_detail = rec.runtime_error
+            rec.checker_error = f"checker error (harness): {type(e).__name__}: {e}"
+            rec.checker_detail = rec.checker_error
 
     rec.total_ms = (time.perf_counter() - t0) * 1000
     return rec
@@ -157,27 +207,30 @@ def composite_score(records: list[DevTaskResult]) -> float:
     per timeout/failure-to-execute, so a model that passes everything but
     crashes on one task ranks below a clean one.
     """
-    n = len(records)
+    # Checker bugs are harness errors, not the model's: those tasks are not scored.
+    scored = [r for r in records if not r.checker_error]
+    n = len(scored)
     if n == 0:
         return 0.0
-    passed = sum(1 for r in records if r.passed)
+    passed = sum(1 for r in scored if r.passed)
     accuracy_pts = (passed / n) * 100.0
-    runtime_errors = sum(1 for r in records if r.runtime_error and not r.passed)
-    request_fails = sum(1 for r in records if not r.request_ok)
+    runtime_errors = sum(1 for r in scored if r.runtime_error and not r.passed)
+    request_fails = sum(1 for r in scored if not r.request_ok)
     penalty = 5.0 * runtime_errors + 10.0 * request_fails
     return max(0.0, round(accuracy_pts - penalty, 1))
 
 
 def _assemble(cfg: RunConfig, server_info: dict, records: list[DevTaskResult]) -> dict:
     n = len(records)
-    passed = sum(1 for r in records if r.passed)
+    scored = [r for r in records if not r.checker_error]  # checker bugs don't count against the model
+    passed = sum(1 for r in scored if r.passed)
     runtime_errors = [r for r in records if r.runtime_error and not r.passed]
     request_fails = [r for r in records if not r.request_ok]
     total_ms_all = [r.total_ms for r in records]
 
     # Breakdown by task kind (which dev skill is strongest/weakest).
     by_kind: dict[str, dict] = {}
-    for r in records:
+    for r in scored:
         k = by_kind.setdefault(r.kind, {"n": 0, "passed": 0})
         k["n"] += 1
         k["passed"] += 1 if r.passed else 0
@@ -190,6 +243,9 @@ def _assemble(cfg: RunConfig, server_info: dict, records: list[DevTaskResult]) -
     ] + [
         {"task_id": r.task_id, "kind": r.kind, "error": f"request failed: {r.request_error}"}
         for r in request_fails
+    ] + [
+        {"task_id": r.task_id, "kind": r.kind, "error": r.checker_error}
+        for r in records if r.checker_error
     ]
 
     return {
@@ -198,7 +254,8 @@ def _assemble(cfg: RunConfig, server_info: dict, records: list[DevTaskResult]) -
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "model": cfg.model,
             "endpoint": cfg.endpoint,
-            "temperature": cfg.temperature,
+            # The dev client always samples at 0.0 regardless of cfg.temperature.
+            "temperature": 0.0,
             "max_tokens": cfg.max_tokens,
             # How the SERVER serves the model (Unsloth Studio / llama.cpp), not
             # the agent harness. See REPORT_SPEC.md.
@@ -211,6 +268,7 @@ def _assemble(cfg: RunConfig, server_info: dict, records: list[DevTaskResult]) -
                 "status": r.status, "passed": r.passed,
                 "checker_detail": r.checker_detail,
                 "runtime_error": r.runtime_error,
+                "checker_error": r.checker_error,
                 "request_error": r.request_error,
                 "total_ms": round(r.total_ms, 1),
                 "prompt_tokens": r.prompt_tokens,
@@ -222,9 +280,10 @@ def _assemble(cfg: RunConfig, server_info: dict, records: list[DevTaskResult]) -
         "summary": {
             "n_tasks": n,
             "passed": passed,
-            "accuracy": round(passed / n, 3) if n else None,
+            "accuracy": round(passed / len(scored), 3) if scored else None,
             "runtime_errors": len(runtime_errors),
             "request_failures": len(request_fails),
+            "checker_errors": sum(1 for r in records if r.checker_error),
             "total_execution_ms": {
                 "mean": round(sum(total_ms_all) / len(total_ms_all), 1) if total_ms_all else None,
                 "median": _med(total_ms_all),
@@ -245,11 +304,16 @@ def render_dev_markdown(doc: dict) -> str:
         f"- Gave it {s['n_tasks']} real coding jobs (write, fix, refactor, build). "
         f"It finished them all and we ran its code to check the work."
     ]
-    if s["passed"] == s["n_tasks"]:
-        plain.append(f"- **All {s['passed']}/{s['n_tasks']} jobs passed** — every program it wrote actually works.")
+    chk = s["checker_errors"]
+    n_scored = s["n_tasks"] - chk
+    if chk:
+        plain.append(f"- {chk} job(s) hit a **harness checker error** — a bug in the "
+                     "test harness, not the model; those jobs are excluded from scoring.")
+    if s["passed"] == n_scored:
+        plain.append(f"- **All {n_scored} scored jobs passed** — every program it wrote actually works.")
     else:
-        plain.append(f"- **{s['passed']}/{s['n_tasks']} jobs passed.** "
-                     f"{'One job' if s['n_tasks'] - s['passed'] == 1 else 'Some jobs'} did not work out — see below.")
+        plain.append(f"- **{s['passed']}/{n_scored} scored jobs passed.** "
+                     f"{'One job' if n_scored - s['passed'] == 1 else 'Some jobs'} did not work out — see below.")
     if s["runtime_errors"]:
         n = s["runtime_errors"]
         plain.append(f"- {n} of its programs **crashed when we ran them** — "

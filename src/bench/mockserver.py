@@ -153,11 +153,32 @@ def merge_intervals(intervals):
             out.append((start, end))
     return out
 ''',
+    "has_cycle": '''\
+def has_cycle(head):
+    seen = set()
+    while head is not None:
+        if id(head) in seen:
+            return True
+        seen.add(id(head))
+        head = head.next
+    return False
+''',
+    "solvable": '''\
+def solvable(puzzle):
+    tiles = [t for t in puzzle if t != 0]
+    inv = sum(1 for i in range(len(tiles))
+              for j in range(i + 1, len(tiles)) if tiles[i] > tiles[j])
+    return inv % 2 == 0
+''',
     # d6/d9 thinking tasks (JSON answers, no code symbol) — matched by unique
     # words in the prompt. Must come LAST: the generic DEV_CODE substring scan
     # runs dict-ordered and "total" would otherwise match the clock prompt.
     "clock": '{"steps": ["Monday noon to Friday noon is 4 days", "Clock gains 5 min/day x 4 = 20 min fast", "Noon + 20 min = 12:20", "12:20 = 740 minutes after midnight"], "answer": 740}',
     "train": '{"steps": ["First 30 km costs $10", "Remaining distance: 120 - 30 = 90 km", "90 / 15 = six full chunks at $4 each = $24", "Total: 10 + 24 = 34"], "answer": 34}',
+    # d12/d13 thinking tasks (JSON answers) — "widgets" / "seating" are unique
+    # to their prompts, so the generic DEV_CODE scan matches them directly.
+    "widgets": '{"steps": ["5 machines make 5 widgets in 5 minutes, so 1 machine makes 1 widget in 5 minutes", "100 machines work in parallel", "100 widgets take 5 minutes"], "answer": 5}',
+    "seating": '{"steps": ["Alice not seat 1 -> Alice in 2 or 3", "Carol not seat 3 -> Carol in 1 or 2", "Bob left of Carol -> Carol cannot be 1 (Bob would need seat 0)", "So Carol=2, Bob=1, Alice=3"], "alice": 3, "bob": 1, "carol": 2}',
 }
 
 S6_ANSWER = (
@@ -290,10 +311,14 @@ class _Handler(BaseHTTPRequestHandler):
         ]
         # Agent tasks are driven by the conversation, not by a canned answer —
         # _detect returns None for them, so we must NOT bail on answer is None.
+        # s4 is now a multi-turn agent task (book_flight → get_booking); the old
+        # one-shot block that emitted a fake get_price call is gone.
         _is_agent = (
             ("list_events" in names and "schedule_event" in names)
             or ("search_kb" in names and "get_facts" in names)
             or ("list_items" in names and "adjust_stock" in names)
+            or ("book_flight" in names and "get_booking" in names)
+            or ("list_tasks" in names and "update_task" in names)
         )
         if not _is_agent and answer is None:
             return []
@@ -303,27 +328,12 @@ class _Handler(BaseHTTPRequestHandler):
                 "name": "get_weather",
                 "arguments": {"city": "Tokyo", "unit": "celsius"},
             }]
-        if "book_flight" in names:
-            calls = [{
-                "name": "book_flight",
-                "arguments": {
-                    "from_city": "Paris", "to_city": "Berlin",
-                    "date": "2026-12-05", "passengers": 2, "cabin": "economy",
-                },
-            }]
-            if "get_price" in names:
-                calls.append({
-                    "name": "get_price",
-                    "arguments": {"booking_id": "bk_mock_42", "currency": "EUR"},
-                })
-            return calls
 
         # --- agent tasks (multi-turn): drive by conversation state ---------
         msgs = messages or []
         tool_results = [
             m for m in msgs if m.get("role") == "tool"
         ]
-        user_text = msgs[0].get("content", "") if msgs else ""
 
         # a1: calendar scheduling (list_events → find_free_slots → schedule_event)
         if "list_events" in names and "schedule_event" in names:
@@ -347,6 +357,34 @@ class _Handler(BaseHTTPRequestHandler):
                 return [{"name": "search_kb", "arguments": {"query": "invoice_total_usd"}}]
             if len(tool_results) == 1:
                 return [{"name": "get_facts", "arguments": {"topic": "vat"}}]
+            return []  # complete → final answer
+
+        # a4: task-board triage (list_tasks → update_task T-101 → final answer)
+        if "list_tasks" in names and "update_task" in names:
+            if not tool_results:
+                return [{"name": "list_tasks", "arguments": {}}]
+            if len(tool_results) == 1:
+                return [{"name": "update_task", "arguments": {
+                    "id": "T-101", "status": "in_progress", "owner": "ana",
+                }}]
+            return []  # complete → final answer
+
+        # s4: flight booking (book_flight → get_booking(id from booking result) → answer)
+        if "book_flight" in names and "get_booking" in names:
+            if not tool_results:
+                return [{
+                    "name": "book_flight",
+                    "arguments": {
+                        "from_city": "Paris", "to_city": "Berlin",
+                        "date": "2026-12-05", "passengers": 2, "cabin": "economy",
+                    },
+                }]
+            if len(tool_results) == 1:
+                try:
+                    bid = json.loads(tool_results[0].get("content", "{}")).get("booking_id", "")
+                except (json.JSONDecodeError, AttributeError):
+                    bid = ""
+                return [{"name": "get_booking", "arguments": {"booking_id": bid}}]
             return []  # complete → final answer
 
         # a3: inventory audit (list_items → get_item x3 → adjust_stock x2 → final answer)
@@ -405,6 +443,14 @@ class _Handler(BaseHTTPRequestHandler):
                 answer = "Invoice total $240 + 15% VAT = $276. Total including VAT: 276 USD."
             elif "list_items" in tool_names and "adjust_stock" in tool_names:
                 answer = "Reordered laptop (+10) and keyboard (+10); both were below the 10-unit threshold."
+            elif "book_flight" in tool_names and "get_booking" in tool_names:
+                answer = "Flight booked: Paris to Berlin, 2 passengers, economy. Total price: 299.00 EUR."
+            elif "list_tasks" in tool_names and "update_task" in tool_names:
+                answer = "Moved T-101 to in_progress and assigned it to ana. Changed tasks: T-101."
+            elif "list_packages" in tool_names:
+                # a5's checker inspects only the final answer text, so a direct
+                # dependency-valid build order passes without tool round-trips.
+                answer = "core\nutils\nnet\napp\ncli"
 
         if answer is None:
             # perf-style free generation: exactly max_tokens tokens

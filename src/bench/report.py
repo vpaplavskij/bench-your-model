@@ -53,6 +53,17 @@ def now_ts() -> str:
     return datetime.now(timezone.utc).strftime(_RUN_TS_FMT)
 
 
+def run_ts(root: str | Path, model: str, quant: str | None = None) -> str:
+    """Fresh run-folder timestamp; never reuses an existing folder (same-second re-runs)."""
+    ts = now_ts()
+    d = model_dir(root, model, quant)
+    n = 1
+    while (d / ts).exists():
+        n += 1
+        ts = f"{now_ts()}-{n}"
+    return ts
+
+
 def write_standard(
     root: str | Path,
     model: str,
@@ -60,7 +71,6 @@ def write_standard(
     std: str,
     doc: dict,
     md: str,
-    status: str = "ok",
     quant: str | None = None,
 ) -> tuple[Path, Path]:
     """Write one standard's json+md into the run folder."""
