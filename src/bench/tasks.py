@@ -768,7 +768,7 @@ AGENT_TASKS: list[dict] = [
             {
                 "role": "user",
                 "content": (
-                    "Find a free 30-minute slot on Tuesday 2026-11-11 between 09:00 and 17:00 "
+                    "Find a free 30-minute slot on Wednesday 2026-11-11 between 09:00 and 17:00 "
                     "and schedule a meeting titled 'Design sync' at 15:30."
                 ),
             },
@@ -851,12 +851,14 @@ AGENT_TASKS: list[dict] = [
         "max_steps": 12,
         # Deterministic check: every product must have been looked up, and the
         # two low-stock items (laptop=3, keyboard=8; mouse=15 is fine) must each
-        # receive exactly one +10 reorder adjustment — and mouse must NOT be touched.
+        # end up with exactly +10 units, and mouse must stay untouched. Checking
+        # the FINAL stock levels catches double-reorders and wrong deltas that
+        # an any()-style check (\"at least one +10\") lets through.
         "check": lambda env, content: (
             set(env["items_queried"]) >= {"laptop", "mouse", "keyboard"}
-            and any(a["item"] == "laptop" and a["delta"] == 10 for a in env["adjustments"])
-            and any(a["item"] == "keyboard" and a["delta"] == 10 for a in env["adjustments"])
-            and not any(a["item"] == "mouse" for a in env["adjustments"])
+            and env["stock"]["laptop"]["qty"] == 13
+            and env["stock"]["keyboard"]["qty"] == 18
+            and env["stock"]["mouse"]["qty"] == 15
         ),
     },
     {

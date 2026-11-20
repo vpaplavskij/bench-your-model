@@ -3,12 +3,13 @@
 Every benchmark report must state **what exactly was tested and how the server
 was serving it**. A run whose quantization or reasoning configuration is not
 recorded is *not comparable* to any other run, and its numbers are nearly
-worthless (see `ANALYSIS.md`: nine past runs formed a 2-quants ×
-2-thinking-modes matrix that was indistinguishable in the reports).
+worthless: nine past runs formed a 2-quants × 2-thinking-modes matrix that was
+indistinguishable in the reports.
 
-This document is the contract. The harness enforces it mechanically:
-`--quant` is required by convention and every run document stores the settings
-block in its `meta`. If you can't fill a field in, **ask** — never guess.
+This document is the contract. The harness supports it: `--quant` is required
+by convention (missing → stderr warning), and every run document stores the
+settings block in its `meta`. If you can't fill a field in, **ask** — never
+guess.
 
 ## 1. Required settings (per model under test)
 
@@ -42,7 +43,7 @@ results/<MODEL>-<QUANT>/
   `results/unsloth_Qwen3.8-27B-GGUF-IQ3_S/`).
 - **One folder per quant.** The same model at two different quants lives in
   two folders and must never be mixed into one — that is exactly the failure
-  mode from `ANALYSIS.md`.
+  mode of those nine past runs.
 - If you don't know the quant, the harness still writes to `results/<MODEL>/`
   (no suffix) and warns on stderr; backfill per §6 afterwards.
 

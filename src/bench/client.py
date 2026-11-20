@@ -18,7 +18,8 @@ class ChatResult:
     error: str | None = None
 
     # Timing
-    ttft_ms: float | None = None          # time to first token (streaming)
+    ttft_ms: float | None = None          # time to first CONTENT token (streaming)
+    ttft_first_token_ms: float | None = None  # time to first token incl. reasoning_content
     total_ms: float = 0.0                # wall time for the whole request
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
@@ -166,7 +167,7 @@ class BenchClient:
     # ------------------------------------------------------------------ #
     # Models endpoint (server / model sanity check)
     # ------------------------------------------------------------------ #
-    def list_models(self) -> list[dict]:
+    def list_models(self) -> list[str]:
         r = self._http.get("/models")
         r.raise_for_status()
         data = r.json()
@@ -218,6 +219,7 @@ class BenchClient:
         samples: list[StreamSample] = []
         t_start = time.perf_counter()
         first_token_at: float | None = None
+        first_content_at: float | None = None
         pieces: list[str] = []
         # Native tool-call deltas arrive as partial fragments that must be
         # merged by index (OpenAI streaming contract); llama.cpp sends the full
@@ -249,16 +251,27 @@ class BenchClient:
                     delta = choice.get("delta") or {}
                     token = delta.get("content")
                     if token:
+                        if first_content_at is None:
+                            first_content_at = now
                         if first_token_at is None:
                             first_token_at = now
                         samples.append(StreamSample(t=now))
                         pieces.append(token)
                         res.stream_chunks += 1
-                    tc_deltas = delta.get("tool_calls") or []
-                    if tc_deltas and first_token_at is None:
-                        # A tool-call delta IS the first token; TTFT must count
-                        # it or tool-only answers record ttft=None (seen on s3).
+                    elif delta.get("reasoning_content") and first_token_at is None:
+                        # Thinking models stream reasoning_content first: it IS
+                        # the first token. ttft_ms stays content-only (the decode
+                        # window must exclude thinking), but ttft_first_token_ms
+                        # records the real prefill end for prefill tok/s.
                         first_token_at = now
+                    tc_deltas = delta.get("tool_calls") or []
+                    if tc_deltas:
+                        # A tool-call delta IS the first token; tool-only answers
+                        # must not record ttft=None (seen on s3).
+                        if first_content_at is None:
+                            first_content_at = now
+                        if first_token_at is None:
+                            first_token_at = now
                     for tc in tc_deltas:
                         _merge_tool_call(tc_index, tc)
                     usage = chunk.get("usage")
@@ -282,6 +295,8 @@ class BenchClient:
         res.tool_calls = _finalize_tool_calls(tc_index)
         res.total_ms = (time.perf_counter() - t_start) * 1000
         if first_token_at is not None:
-            res.ttft_ms = first_token_at * 1000
+            res.ttft_first_token_ms = first_token_at * 1000
+        if first_content_at is not None:
+            res.ttft_ms = first_content_at * 1000
         res.stream_metrics = StreamMetrics(samples)
         return res

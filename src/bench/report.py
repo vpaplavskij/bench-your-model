@@ -79,6 +79,6 @@ def write_standard(
     rdir.mkdir(parents=True, exist_ok=True)
     jp = rdir / f"{std}.json"
     mp = rdir / f"{std}.md"
-    jp.write_text(json.dumps(doc, indent=2))
-    mp.write_text(md)
+    jp.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+    mp.write_text(md, encoding="utf-8")
     return jp, mp

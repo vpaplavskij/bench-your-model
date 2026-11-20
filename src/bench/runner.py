@@ -46,21 +46,33 @@ def run_benchmark(cfg: RunConfig) -> dict:
         print("WARNING: LLM judge = model under test (self-assessment). Pass --judge-model "
               "to score open tasks with a different model.", file=sys.stderr)
 
+    # A --judge-model different from the model under test needs its own client;
+    # otherwise the model under test would judge itself even when the flag is set.
+    judge_client = client
+    if cfg.judge_model and cfg.judge_model != cfg.model:
+        judge_client = BenchClient(
+            endpoint=cfg.endpoint, model=cfg.judge_model, api_key=cfg.api_key,
+            timeout_s=cfg.timeout_s, max_tokens=cfg.max_tokens, temperature=0.0,
+        )
+
     print(f"Running {len(tasks)} task(s) against {cfg.endpoint} (model={cfg.model})")
     for task in tasks:
-        rec = _run_task(client, cfg, task, judge_model)
+        rec = _run_task(client, cfg, task, judge_model, judge_client)
         records.append(rec)
         status = "OK " if rec["request_ok"] else "ERR"
+        score = rec.get("score") or {}  # absent when the request failed
         score_txt = ""
-        if rec["suite"] == "structured":
-            score_txt = "correct" if rec["score"]["correct"] else "WRONG"
-        elif rec["score"].get("scores"):
-            avg = sum(rec["score"]["scores"].values()) / len(rec["score"]["scores"])
+        if rec["suite"] == "structured" and rec["request_ok"]:
+            score_txt = "correct" if score.get("correct") else "WRONG"
+        elif score.get("scores"):
+            avg = sum(score["scores"].values()) / len(score["scores"])
             score_txt = f"judge={avg:.2f}"
-        print(f"  [{status}] {task['id']} {task['name']}: ttft={rec['ttft_ms'] and round(rec['ttft_ms'])}ms "
-              f"total={round(rec['total_ms'])}ms {score_txt}")
+        print(f"  [{status}] {task['id']} {task['name']}: ttft={fmt_ms(rec['ttft_ms'])} "
+              f"total={fmt_ms(rec['total_ms'])} {score_txt}")
 
     client.close()
+    if judge_client is not client:
+        judge_client.close()
     return _assemble(cfg, server_info, records)
 
 
@@ -119,32 +131,37 @@ def _run_agent_task(client: BenchClient, cfg: RunConfig, task: dict) -> dict:
             break
 
         all_calls.extend(calls)
+        # Parallel calls belong in ONE assistant message (OpenAI protocol),
+        # followed by one tool result per call id.
+        assistant_calls: list[dict] = []
+        tool_results: list[dict] = []
         for call in calls:
             call_id = f"call_{call_seq}"
             call_seq += 1
             name = call.get("name", "")
             args = call.get("arguments") or {}
-            if not isinstance(args, dict):
-                # arguments may have failed to parse; keep raw text.
+            if args.get("_raw_arguments"):
+                # arguments failed to parse client-side; keep raw text.
                 try:
-                    args = json.loads(call.get("_raw_arguments") or "{}")
+                    args = json.loads(args["_raw_arguments"])
                 except (ValueError, TypeError):
                     args = {}
-            result = task["step"](env, name, args) if env is not None else {"error": "no env"}
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": call_id,
-                    "type": "function",
-                    "function": {"name": name, "arguments": json.dumps(args)},
-                }],
+            try:
+                result = task["step"](env, name, args) if env is not None else {"error": "no env"}
+            except Exception as e:  # noqa: BLE001 - a bad tool argument (e.g. int("ten")) is a task failure, not a run abort
+                result = {"error": f"tool call failed: {type(e).__name__}: {e}"}
+            assistant_calls.append({
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args)},
             })
-            messages.append({
+            tool_results.append({
                 "role": "tool",
                 "tool_call_id": call_id,
                 "content": json.dumps(result),
             })
+        messages.append({"role": "assistant", "content": None, "tool_calls": assistant_calls})
+        messages.extend(tool_results)
 
     rec = _rec_base()
     rec["request_ok"] = True
@@ -178,7 +195,8 @@ def _run_agent_task(client: BenchClient, cfg: RunConfig, task: dict) -> dict:
     return rec
 
 
-def _run_task(client: BenchClient, cfg: RunConfig, task: dict, judge_model: str) -> dict:
+def _run_task(client: BenchClient, cfg: RunConfig, task: dict, judge_model: str,
+              judge_client: BenchClient | None = None) -> dict:
     # Agent tasks run their own multi-turn loop.
     if task.get("kind") == "agent":
         return _run_agent_task(client, cfg, task)
@@ -216,7 +234,7 @@ def _run_task(client: BenchClient, cfg: RunConfig, task: dict, judge_model: str)
     elif task["suite"] == "open" and res.ok:
         rec["score"] = score_open(task, res.content)
         # LLM judge (skipped if the model under test is not usable as judge)
-        jres = client.chat(build_judge_messages(task, res.content))
+        jres = (judge_client or client).chat(build_judge_messages(task, res.content))
         if jres.ok:
             scores = parse_judge_scores(jres.content, rec["score"]["dimensions"])
             rec["judge"] = {"model": judge_model, "raw": jres.content[:500]}

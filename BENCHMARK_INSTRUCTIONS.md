@@ -52,7 +52,7 @@ the path of the generated run folder when it finishes.
 A run is complete when the harness writes one timestamped run folder:
 
 ```
-results/<model>/
+results/<MODEL>-<QUANT>/
   <run-ts>/            # one folder per run (UTC timestamp)
     quality.json/.md   perf.json/.md   dev.json/.md
 ```

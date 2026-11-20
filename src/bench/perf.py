@@ -25,6 +25,7 @@ import statistics
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from uuid import uuid4
 
 from .client import BenchClient
 from .humanize import fmt_ms, fmt_tps, glossary_md
@@ -37,10 +38,16 @@ _FILLER = ("The quick brown fox jumps over the lazy dog near the river bank whil
 
 
 def _prompt_of_size(target_tokens: int) -> tuple[str, int]:
-    """Build a prompt of ~target_tokens tokens (approx: 1 token/word)."""
+    """Build a prompt of ~target_tokens tokens (approx: 1 token/word).
+
+    The instruction asks for a long continuation so the model keeps generating
+    until the max_tokens cap; a "one short sentence" prompt stops ~20 tokens in
+    and decode speed would be measured over a tiny window.
+    """
     words = target_tokens
     text = _FILLER * (words // len(_FILLER.split()) + 1)
-    return text[: words * 7] + " Summarize the above in one short sentence.", words
+    return text[: words * 7] + (" Continue the passage above with a long, detailed, "
+                                "fictional narrative of many paragraphs."), words
 
 
 def warmup(client: BenchClient, prompt: str, max_tokens: int) -> None:
@@ -55,6 +62,7 @@ class PerfRun:
     ok: bool
     error: str | None = None
     ttft_ms: float | None = None
+    ttft_first_token_ms: float | None = None  # incl. reasoning chunks; prefill basis
     total_ms: float = 0.0
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
@@ -80,12 +88,17 @@ class PerfPoint:
 
 
 def _time_request(client: BenchClient, prompt: str, max_tokens: int) -> PerfRun:
-    res = client.chat([{"role": "user", "content": prompt}], max_tokens=max_tokens)
+    # Nonce prefix defeats llama.cpp's prompt-prefix KV cache reuse: without it
+    # every measured run replays the warmup's cached prefill and prefill tok/s
+    # is measured on a cache hit, not on real prompt processing.
+    res = client.chat([{"role": "user", "content": uuid4().hex[:12] + " " + prompt}],
+                      max_tokens=max_tokens)
     run = PerfRun(ok=res.ok, error=res.error)
     if not res.ok:
         return run
     sm = res.stream_metrics
     run.ttft_ms = res.ttft_ms
+    run.ttft_first_token_ms = res.ttft_first_token_ms
     run.total_ms = res.total_ms
     run.prompt_tokens = res.prompt_tokens
     run.completion_tokens = res.completion_tokens
@@ -97,12 +110,15 @@ def _time_request(client: BenchClient, prompt: str, max_tokens: int) -> PerfRun:
     # Derived speeds (guard: need >=2 tokens for a decode span).
     # Decode counts CONTENT chunks only — usage completion_tokens include
     # thinking tokens and would inflate decode_tps on thinking servers.
+    # Prefill uses time to the FIRST token (reasoning included): on thinking
+    # servers ttft_ms is time to first ANSWER token, which understates prefill.
+    prefill_ttft = res.ttft_first_token_ms or res.ttft_ms
     if res.ttft_ms and res.total_ms > res.ttft_ms:
         n = res.stream_chunks
         if n >= 2:
             run.decode_tps = (n - 1) / ((res.total_ms - res.ttft_ms) / 1000.0)
-        if res.prompt_tokens:
-            run.prefill_tps = res.prompt_tokens / (res.ttft_ms / 1000.0)
+        if res.prompt_tokens and prefill_ttft:
+            run.prefill_tps = res.prompt_tokens / (prefill_ttft / 1000.0)
     return run
 
 
@@ -179,10 +195,11 @@ def diagnose(points: list[PerfPoint]) -> list[str]:
     if not ok_pts:
         return ["no successful runs — nothing to diagnose"]
 
-    # 1) prefill vs decode share of total time (median per point, averaged)
+    # 1) prefill vs decode share of total time (median run per point, averaged)
     shares: list[float] = []
     for p in ok_pts:
-        r = max(p.ok_runs, key=lambda x: x.total_ms or 0)
+        totals = sorted((r.total_ms or 0) for r in p.ok_runs)
+        r = p.ok_runs[totals.index(totals[len(totals) // 2])]  # median run by total_ms
         if r.ttft_ms and r.total_ms > r.ttft_ms:
             shares.append(r.ttft_ms / r.total_ms)
     if shares:
@@ -263,6 +280,7 @@ def _assemble(cfg, server_info: dict, points: list[PerfPoint], output_tokens: in
             "runs_total": len(p.runs),
             "errors": [r.error for r in p.runs if not r.ok],
             "ttft_ms": {"mean": _mean([r.ttft_ms for r in ok]), "median": _med([r.ttft_ms for r in ok])},
+            "ttft_first_token_ms": {"mean": _mean([r.ttft_first_token_ms for r in ok]), "median": _med([r.ttft_first_token_ms for r in ok])},
             "total_ms": {"mean": _mean([r.total_ms for r in ok]), "median": _med([r.total_ms for r in ok])},
             "prefill_tps": {"mean": _mean([r.prefill_tps for r in ok]), "median": _med([r.prefill_tps for r in ok])},
             "decode_tps": {"mean": _mean([r.decode_tps for r in ok]), "median": _med([r.decode_tps for r in ok])},
@@ -312,7 +330,7 @@ def render_perf_markdown(doc: dict) -> str:
     if h.get("ttft_ms_median") is not None:
         plain.append(f"- First word arrives after **{fmt_ms(h['ttft_ms_median'])}** "
                      f"(median across all test lengths).")
-    plain.append(f"- Every answer was capped at {m['output_tokens']} words; "
+    plain.append(f"- Every answer was capped at {m['output_tokens']} tokens; "
                  f"each size tested {m['measure_runs']} times (plus 1 warm-up, discarded).")
     _p_total = sum(
         float((pt.get("total_ms") or {}).get("mean")) * int(pt.get("runs_ok") or 0)

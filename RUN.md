@@ -31,11 +31,13 @@ config; ask if you can't find them (see `REPORT_SPEC.md`):
 From the project root:
 
 ```bash
-uv run bench all --model <MODEL> --endpoint <ENDPOINT> --api-key <API_KEY> \
+uv run bench all --model <MODEL> --endpoint <ENDPOINT> \
   --quant <QUANT> --reasoning-level <REASONING LEVEL> \
   --reasoning-budget <REASONING BUDGET> --preserve-thinking \
   --context-length <CONTEXT LENGTH> > /tmp/bench-run.log 2>&1
 ```
+
+- Set the key via the `BENCH_API_KEY` env var rather than `--api-key` so it never lands in shell history; omit both if the server needs no key.
 
 - Use `--no-preserve-thinking` if the server does not preserve thinking; omit a flag only if it is genuinely unknown.
 - Results go to `results/<MODEL>-<QUANT>/`.

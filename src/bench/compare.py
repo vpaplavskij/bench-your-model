@@ -44,7 +44,7 @@ def _load_run(run: Path) -> dict | None:
 
     total_ms = sum(t.get("total_ms") or 0.0 for t in (q or {}).get("tasks", []))
     total_ms += sum(t.get("total_ms") or 0.0 for t in (d or {}).get("tasks", []))
-    total_ms += sum((pt.get("total_ms") or {}).get("mean") or 0.0
+    total_ms += sum(((pt.get("total_ms") or {}).get("mean") or 0.0)
                     * (pt.get("runs_ok") or 0) for pt in (p or {}).get("points", []))
 
     judge = qs.get("judge_dimension_means") or {}

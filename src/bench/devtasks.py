@@ -121,10 +121,20 @@ Return ONLY the refactored code (no markdown fences, no explanation).
 
 T3_CHECKER = """\
 def check(code_src, run):
-    # Behavior must be preserved AND no explicit loop may remain.
-    import re
-    if re.search(r'\\b(for|while)\\b', code_src):
-        return {"pass": False, "detail": "refactor still contains an explicit for/while loop"}
+    # Behavior must be preserved AND no loop construct may remain. A plain text
+    # scan for for|while fails correct solutions whose docstrings or comments
+    # mention them, so inspect the parsed syntax tree instead.
+    import ast
+    try:
+        tree = ast.parse(code_src)
+    except SyntaxError as e:
+        return {"pass": False, "detail": f"code does not parse: {e}"}
+    loop_nodes = (ast.For, ast.AsyncFor, ast.While,
+                  ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+    for node in ast.walk(tree):
+        if isinstance(node, loop_nodes):
+            return {"pass": False,
+                    "detail": f"refactor still contains a loop construct ({type(node).__name__})"}
     r = run(code_src)
     if not r["ok"]:
         return {"pass": False, "detail": f"code did not import/run: {r['error']}"}
@@ -619,8 +629,10 @@ def extract_code(text: str) -> str:
     """
     import re
     text = text.strip()
-    # Prefer a python fence if present.
-    m = re.search(r"```(?:python|py)?\s*\n(.*?)```", text, re.DOTALL)
+    # Prefer a python fence if present. Case-insensitive and python3.x-aware:
+    # ```Python / ```python3 fences previously fell through and scored as a
+    # runtime error.
+    m = re.search(r"```(?:python[0-9.]*|py)\s*\n(.*?)```", text, re.DOTALL | re.IGNORECASE)
     if m:
         return m.group(1).strip()
     # Otherwise, if the whole thing looks like code (has a def/def-like line),

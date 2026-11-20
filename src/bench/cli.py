@@ -20,6 +20,7 @@ import os
 import sys
 
 from .config import RunConfig, add_settings_args, build_parser, parse_args
+from .humanize import pct
 from .runner import run_benchmark, render_markdown
 
 
@@ -142,7 +143,7 @@ def _run_dev(argv: list[str]) -> int:
         quant=args.quant)
 
     s = doc["summary"]
-    print(f"\nAccuracy: {s['passed']}/{s['n_tasks']} ({s['accuracy']:.0%})  |  "
+    print(f"\nAccuracy: {s['passed']}/{s['n_tasks']} ({pct(s['accuracy'])})  |  "
           f"runtime errors: {s['runtime_errors']}  |  composite score: {s['composite_score']}/100")
     if doc["error_log"]:
         print(f"WARNING: {len(doc['error_log'])} dev task(s) failed/errored — read dev.json, "
@@ -265,7 +266,8 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(argv) if argv is not None else sys.argv[1:]
     # Dispatch on the first token BEFORE parsing, so `bench <mode> --help` works.
     mode = argv[0] if argv and argv[0] in ("quality", "perf", "dev", "all", "mock") else "quality"
-    rest = argv[1:] if mode != "quality" else argv
+    # Drop the subcommand token only when it was typed explicitly ("bench quality ...").
+    rest = argv[1:] if argv and argv[0] == mode else argv
 
     if mode == "perf":
         return _run_perf(rest)

@@ -89,8 +89,8 @@ For each prompt size in `--prompt-sizes` (default `128,512,1024,2048`):
 ### Metrics
 | Metric | Meaning |
 |---|---|
-| **TTFT** (ms) | time to first token — the prefill-bound phase |
-| **Prefill speed** (tok/s) | prompt_tokens / TTFT — how fast the prompt is processed |
+| **TTFT** (ms) | time to first **content/tool** chunk (first token incl. thinking is also recorded; used for prefill) |
+| **Prefill speed** (tok/s) | prompt_tokens / first-token time — how fast the prompt is processed (measured prompts get a cache-busting nonce) |
 | **Decode speed** (tok/s) | (N−1) / (total − TTFT) — autoregressive generation speed |
 | **ITL mean / p95 / max** (ms) | inter-token latency: stability of generation |
 | **Stalls** (>500 ms gaps) | server hiccups (CPU offload, page faults, GC, OOM) |
@@ -117,7 +117,7 @@ Output: `results/<model>-<QUANT>/<run-ts>/perf.json` + `perf.md`.
 
 | Group | Metric | How |
 |---|---|---|
-| **Latency** | TTFT (time to first token) | streamed request, perf_counter at first non-empty `delta` |
+| **Latency** | TTFT (time to first token) | streamed request, perf_counter at first non-empty content/tool `delta` |
 | **Throughput** | Output speed (tokens/s) | `completion_tokens / total wall time`; when the server omits `usage`, chunk count is used as an approximate completion-token count so speed is never silently lost |
 | **Request size** | prompt tokens, completion tokens | server-reported `usage` (completion falls back to stream-chunk count if absent) |
 | **Reliability** | success rate, finish reasons, errors | per-task request record |
@@ -127,6 +127,8 @@ Output: `results/<model>-<QUANT>/<run-ts>/perf.json` + `perf.md`.
 ### Task suites
 - `structured` (deterministic): arithmetic, multi-step arithmetic, single &
   multi tool-calls, list extraction — scored exactly.
+- `agent` (multi-turn): tool-loop tasks driven by the harness against a
+  scripted fake environment — scored on the final answer and env state.
 - `open` (LLM-judged): summarization faithfulness/brevity, strict formatting,
   tone/instruction following.
 
@@ -137,7 +139,7 @@ Add tasks in `src/bench/tasks.py` — a task is just a dict.
 uv run bench quality --model <name> --endpoint http://localhost:8080/v1 --suite all
 ```
 
-Useful flags: `--concurrency 4`, `--timeout 300`, `--max-tokens 4096`,
+Useful flags: `--timeout 300`, `--max-tokens 4096`,
 `--temperature 0`, `--task s1 --task o2` (subset), `--root results`.
 
 Output: `results/<model>-<QUANT>/<run-ts>/quality.json` + `quality.md`.
@@ -171,7 +173,8 @@ model's code and tests its behavior.
 ```bash
 uv run bench dev --model <name> --endpoint http://localhost:8080/v1
 ```
-Flags: `--task d1` (subset), `--max-tokens`, `--temperature`, `--timeout`.
+Flags: `--task d1` (subset), `--max-tokens`, `--timeout`. (`--temperature` is
+quality-only — dev requests always use temperature 0.)
 
 Output: `results/<model>-<QUANT>/<run-ts>/dev.json` + `dev.md` (includes a per-task
 **error log** of exactly what went wrong during execution).
@@ -216,6 +219,8 @@ recorded.
   best-effort JSON extraction (still scored).
 - Prompt sizes are approximate (1 token/word filler text); actual prompt token
   counts are taken from the server's `usage` and reported per point.
-- The dev harness executes model code in a plain `exec` namespace (no network,
-  no filesystem sandbox) — fine for benchmarking trusted local models; do not
-  point it at untrusted remote endpoints.
+- The dev harness executes model code in a guarded `exec` namespace — imports
+  of filesystem/network/subprocess modules (os, socket, subprocess, shutil,
+  pathlib, …) and `open()` are blocked, json/re/collections stay available,
+  and a SIGALRM watchdog kills hangs. Fine for benchmarking trusted local
+  models; do not point it at untrusted remote endpoints.

@@ -16,6 +16,7 @@ from __future__ import annotations
 import signal
 import statistics
 import time
+import traceback
 import types
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -36,7 +37,10 @@ from .humanize import fmt_ms, glossary_md, pct
 # reached via gc); upgrade to a real sandbox if the harness ever faces remote servers.
 _BLOCKED_MODULES = frozenset({"os", "sys", "socket", "subprocess", "shutil", "tempfile",
                               "http", "urllib", "pathlib", "ctypes", "pty", "signal",
-                              "multiprocessing", "threading"})
+                              "multiprocessing", "threading",
+                              # io/builtins/importlib/posix were the escape hatch:
+                              # io.open and builtins.open bypassed the popped open().
+                              "io", "builtins", "importlib", "posix"})
 
 # SIGALRM guard (Linux, single-threaded main loop): an infinite loop in
 # model-written code would otherwise hang the whole bench run forever.
@@ -142,22 +146,55 @@ def _run_dev_task(client: BenchClient, task: dict) -> DevTaskResult:
     rec.completion_tokens = res.completion_tokens
     rec.code = extract_code(res.content)
 
-    # Execute the model's code, then apply the deterministic checker.
-    run_res = run_code(rec.code)
+    # Thinking tasks answer with JSON, not Python: exec'ing it would turn a
+    # valid answer containing null/true into a fake "runtime error". Their
+    # checkers never call `run`.
+    run_res = {"ok": True, "error": None, "ns": {}} if task["kind"] == "thinking" else run_code(rec.code)
     if not run_res["ok"]:
         rec.runtime_error = run_res["error"]
         rec.passed = False
         rec.checker_detail = f"code failed to import/run: {run_res['error']}"
     else:
         check_fn = _load_checker(task["checker_src"])
+
+        def _run(src: str) -> dict:
+            r = run_code(src)
+            if r["ok"]:
+                # run_code disarms its timer on return; re-arm it so the model's
+                # function CALLS made by the checker are watchdog-guarded too
+                # (a wrong has_cycle looping forever on a cyclic list would
+                # otherwise hang the whole run).
+                signal.signal(signal.SIGALRM, _alarm_handler)
+                signal.setitimer(signal.ITIMER_REAL, _DEV_EXEC_TIMEOUT_S, _DEV_EXEC_TIMEOUT_S)
+            return r
+
         try:
-            outcome = check_fn(rec.code, lambda src: run_code(src))
+            signal.signal(signal.SIGALRM, _alarm_handler)
+            signal.setitimer(signal.ITIMER_REAL, _DEV_EXEC_TIMEOUT_S, _DEV_EXEC_TIMEOUT_S)
+            try:
+                outcome = check_fn(rec.code, _run)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
             rec.passed = bool(outcome.get("pass"))
             rec.checker_detail = outcome.get("detail", "")
-        except Exception as e:  # noqa: BLE001 - checker bug shouldn't crash the run or the model's score
-            rec.passed = False
-            rec.checker_error = f"checker error (harness): {type(e).__name__}: {e}"
-            rec.checker_detail = rec.checker_error
+        except _ExecTimeout as e:  # noqa: BLE001
+            # A hang inside the checker's calls is the model's infinite loop —
+            # a scored signal, not a harness bug.
+            rec.runtime_error = str(e)
+            rec.checker_detail = str(e)
+        except Exception as e:  # noqa: BLE001 - checker bug shouldn't crash the run
+            frames = traceback.extract_tb(e.__traceback__)
+            if any(f.filename == "<devtask>" for f in frames):
+                # The exception came from the model's own code (frames compiled
+                # as <devtask>): that's a runtime error of the model's solution,
+                # so it must be scored against the model, not excluded as a
+                # harness checker error (which inflated accuracy).
+                rec.runtime_error = f"{type(e).__name__}: {e}"
+                rec.checker_detail = f"model code raised during checks: {type(e).__name__}: {e}"
+            else:
+                rec.passed = False
+                rec.checker_error = f"checker error (harness): {type(e).__name__}: {e}"
+                rec.checker_detail = rec.checker_error
 
     rec.total_ms = (time.perf_counter() - t0) * 1000
     return rec
