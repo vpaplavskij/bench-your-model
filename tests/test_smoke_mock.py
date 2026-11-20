@@ -3,6 +3,7 @@ README's smoke test describes, asserted instead of eyeballed."""
 import json
 
 from bench.cli import main
+from bench.version import HARNESS_REV
 from conftest import MockServer
 
 SETTINGS_KEYS = {"quant", "reasoning_level", "reasoning_budget",
@@ -34,3 +35,4 @@ def test_bench_all_against_mock(tmp_path):
 
     for doc in (q, d, json.loads((folder / "perf.json").read_text())):
         assert set(doc["meta"]["settings"]) == SETTINGS_KEYS
+        assert doc["meta"]["harness_rev"] == HARNESS_REV

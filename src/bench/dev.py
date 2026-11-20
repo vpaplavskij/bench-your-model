@@ -24,6 +24,7 @@ from pathlib import Path
 
 from .client import BenchClient
 from .config import RunConfig
+from .version import HARNESS_REV
 from .devtasks import DEV_TASKS, extract_code
 from .humanize import fmt_ms, glossary_md, pct
 from .textutil import strip_think
@@ -315,6 +316,7 @@ def _assemble(cfg: RunConfig, server_info: dict, records: list[DevTaskResult]) -
             # How the SERVER serves the model (Unsloth Studio / llama.cpp), not
             # the agent harness. See REPORT_SPEC.md.
             "settings": cfg.settings(),
+            "harness_rev": HARNESS_REV,
         },
         "server": server_info,
         "tasks": [

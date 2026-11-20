@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 
 from .client import BenchClient
 from .config import RunConfig
+from .version import HARNESS_REV
 from .humanize import fmt_ms, fmt_tps, glossary_md, pct
 from .scoring import build_judge_messages, parse_judge_scores, score_open, score_structured
 from .tasks import tasks_for_suite
@@ -313,6 +314,7 @@ def _assemble(cfg: RunConfig, server_info: dict, records: list[dict]) -> dict:
             # How the SERVER serves the model (Unsloth Studio / llama.cpp), not
             # the agent harness. See REPORT_SPEC.md.
             "settings": cfg.settings(),
+            "harness_rev": HARNESS_REV,
         },
         "server": server_info,
         "tasks": records,

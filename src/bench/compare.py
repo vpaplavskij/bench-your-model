@@ -5,8 +5,9 @@ summaries, perf headline and diagnosis) and renders two tables: all runs of
 this model+quant, and the best comparable run per model+quant folder.
 
 Comparability rules:
-* Suite sizes grew over history (quiz 9→11 items, dev 9→13 jobs). Rows whose
-  suite differs from the current run are marked † and excluded from the ranking.
+* Suite sizes grew over history (quiz 9→11 items, dev 9→13 jobs) and scoring
+  changed at harness rev 2. Rows whose suite or harness rev (missing → 1)
+  differs from the current run are marked † and excluded from the ranking.
 * Budget-0 runs (no thinking) are marked ⚠ — their speeds are not comparable
   with thinking runs, and self-inflated decode (usage counts reasoning tokens)
   is noted in the header.
@@ -18,6 +19,7 @@ import json
 from pathlib import Path
 
 from .humanize import fmt_ms, fmt_tps
+from .version import HARNESS_REV
 
 _HDR = "| run | settings | quiz | judge | dev | prefill / decode | TTFT | bottleneck | total |"
 _SEP = "|---|---|---|---|---|---|---|---|---|"
@@ -53,6 +55,8 @@ def _load_run(run: Path) -> dict | None:
         "folder": run.parent.name,
         "ts": run.name,
         "model": first.get("meta", {}).get("model", ""),
+        # Runs predating harness revision stamping are rev 1 (pre-1d3b66d).
+        "rev": first.get("meta", {}).get("harness_rev", 1),
         "settings": f"{st.get('quant') or '?'} · {st.get('reasoning_level') or '?'}"
                     f"/{st.get('reasoning_budget') if st.get('reasoning_budget') is not None else '?'}"
                     f" · {st.get('context_length') or '?'} tok",
@@ -97,7 +101,8 @@ def build_compare(root: str | Path, current_model_dir: Path,
         if not r or r["model"] == "mock-model":  # mock runs are plumbing tests, not model data
             continue
         r["comparable"] = (n_quiz is None or r["n_quiz"] == n_quiz) and \
-                          (n_dev is None or r["n_dev"] == n_dev)
+                          (n_dev is None or r["n_dev"] == n_dev) and \
+                          r["rev"] == HARNESS_REV
         rows.append(r)
 
     this_run = sorted((r for r in rows if run_matches(r, current_model_dir)),
@@ -117,7 +122,8 @@ def build_compare(root: str | Path, current_model_dir: Path,
         "",
         "_decode tok/s excludes thinking tokens from chunk timing but counts them in "
         "usage totals (see AGENTS.md), so treat it as an upper bound for thinking runs; "
-        "⚠ = budget 0 (no thinking), † = different suite size, not comparable._",
+        "⚠ = budget 0 (no thinking), † = different suite size or harness "
+        "revision (unstamped runs are rev 1, pre-audit), not comparable._",
         "",
         "## This model+quant — every recorded run (newest first)",
         "",

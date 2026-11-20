@@ -29,6 +29,7 @@ from uuid import uuid4
 
 from .client import BenchClient
 from .humanize import fmt_ms, fmt_tps, glossary_md
+from .version import HARNESS_REV
 
 # Repeated text that is short per word but long overall (tokenizes densely).
 _FILLER = ("The quick brown fox jumps over the lazy dog near the river bank while "
@@ -363,6 +364,7 @@ def _assemble(cfg, server_info: dict, points: list[PerfPoint], output_tokens: in
             # How the SERVER serves the model (Unsloth Studio / llama.cpp), not
             # the agent harness. See REPORT_SPEC.md.
             "settings": cfg.settings(),
+            "harness_rev": HARNESS_REV,
         },
         "server": server_info,
         "points": doc_points,
