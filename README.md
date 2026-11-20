@@ -164,6 +164,7 @@ model's code and tests its behavior.
 |---|---|
 | **accuracy** (pass rate) | fraction of tasks whose code passes all checks |
 | **runtime errors** | model code that failed to import/run/execute (with the error) |
+| **truncated** | answers cut off at `max_tokens` (common with thinking models); detail says so, score unchanged |
 | **request failures** | server-side failures during the task |
 | **total execution time** | wall time per task (request + check), mean/median/max |
 | **accuracy by skill** | pass rate broken down by task kind — shows where a model is strong/weak |

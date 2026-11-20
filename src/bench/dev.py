@@ -117,6 +117,7 @@ class DevTaskResult:
     checker_detail: str = ""
     runtime_error: str | None = None      # error from executing the model's code
     checker_error: str | None = None      # harness fault (checker failed to load) — never penalizes the model
+    finish_reason: str | None = None      # server finish reason; "length" = answer cut off at max_tokens
     total_ms: float = 0.0                 # whole task wall time (request + check)
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
@@ -144,6 +145,7 @@ def _run_dev_task(client: BenchClient, task: dict) -> DevTaskResult:
 
     rec.prompt_tokens = res.prompt_tokens
     rec.completion_tokens = res.completion_tokens
+    rec.finish_reason = res.raw_finish_reason
     rec.code = extract_code(res.content)
 
     # Thinking tasks answer with JSON, not Python: exec'ing it would turn a
@@ -203,6 +205,11 @@ def _run_dev_task(client: BenchClient, task: dict) -> DevTaskResult:
                 # model's output broke the checks in the checker's own frame —
                 # a plain FAIL, still counted against the model.
                 rec.checker_detail = f"model output broke the checks (counted as FAIL): {detail}"
+
+    # A capped response (very common for thinking models: reasoning eats the
+    # budget) fails because the code is cut off — say so. Scoring unchanged.
+    if rec.finish_reason == "length" and not rec.passed:
+        rec.checker_detail = f"response truncated at max_tokens; {rec.checker_detail}"
 
     rec.total_ms = (time.perf_counter() - t0) * 1000
     return rec
@@ -314,6 +321,7 @@ def _assemble(cfg: RunConfig, server_info: dict, records: list[DevTaskResult]) -
                 "checker_detail": r.checker_detail,
                 "runtime_error": r.runtime_error,
                 "checker_error": r.checker_error,
+                "finish_reason": r.finish_reason,
                 "request_error": r.request_error,
                 "total_ms": round(r.total_ms, 1),
                 "prompt_tokens": r.prompt_tokens,
@@ -329,6 +337,7 @@ def _assemble(cfg: RunConfig, server_info: dict, records: list[DevTaskResult]) -
             "runtime_errors": len(runtime_errors),
             "request_failures": len(request_fails),
             "checker_errors": sum(1 for r in records if r.checker_error),
+            "truncated": sum(1 for r in records if r.finish_reason == "length"),
             "total_execution_ms": {
                 "mean": round(sum(total_ms_all) / len(total_ms_all), 1) if total_ms_all else None,
                 "median": _med(total_ms_all),
@@ -365,6 +374,9 @@ def render_dev_markdown(doc: dict) -> str:
                      f"the code it wrote has a bug in it.")
     if s["request_failures"]:
         plain.append(f"- {s['request_failures']} request(s) never even got an answer back.")
+    if s["truncated"]:
+        plain.append(f"- {s['truncated']} answer(s) hit the max_tokens cap and were cut off — "
+                     "raise --max-tokens (thinking models spend the budget on reasoning).")
     plain.append(f"- A typical job took **{fmt_ms(s['total_execution_ms']['median'])}** from prompt to finished, working code.")
     _d_total = sum(t["total_ms"] for t in doc["tasks"] if t.get("total_ms") is not None)
     if _d_total > 0:
