@@ -26,6 +26,7 @@ from .client import BenchClient
 from .config import RunConfig
 from .devtasks import DEV_TASKS, extract_code
 from .humanize import fmt_ms, glossary_md, pct
+from .textutil import strip_think
 
 
 # --------------------------------------------------------------------------- #
@@ -146,7 +147,9 @@ def _run_dev_task(client: BenchClient, task: dict) -> DevTaskResult:
     rec.prompt_tokens = res.prompt_tokens
     rec.completion_tokens = res.completion_tokens
     rec.finish_reason = res.raw_finish_reason
-    rec.code = extract_code(res.content)
+    # Inline <think>…</think> drafts may contain fenced code blocks: score the
+    # code after the thinking, not a draft from inside it.
+    rec.code = extract_code(strip_think(res.content))
 
     # Thinking tasks answer with JSON, not Python: exec'ing it would turn a
     # valid answer containing null/true into a fake "runtime error". Their

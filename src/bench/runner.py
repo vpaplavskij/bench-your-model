@@ -13,6 +13,7 @@ from .config import RunConfig
 from .humanize import fmt_ms, fmt_tps, glossary_md, pct
 from .scoring import build_judge_messages, parse_judge_scores, score_open, score_structured
 from .tasks import tasks_for_suite
+from .textutil import strip_think
 
 
 def _median(values: list[float]) -> float | None:
@@ -228,13 +229,17 @@ def _run_task(client: BenchClient, cfg: RunConfig, task: dict, judge_model: str,
         "tokens_per_s": res.tokens_per_s,
     }
 
+    # Score on the answer with inline <think>…</think> blocks removed; the raw
+    # content stays in the record for auditability.
+    answer = strip_think(res.content)
+
     # Deterministic scoring for structured tasks
     if task["suite"] == "structured" and res.ok:
-        rec["score"] = score_structured(task, res.content, native_calls=res.tool_calls)
+        rec["score"] = score_structured(task, answer, native_calls=res.tool_calls)
     elif task["suite"] == "open" and res.ok:
-        rec["score"] = score_open(task, res.content)
+        rec["score"] = score_open(task, answer)
         # LLM judge (skipped if the model under test is not usable as judge)
-        jres = (judge_client or client).chat(build_judge_messages(task, res.content))
+        jres = (judge_client or client).chat(build_judge_messages(task, answer))
         if jres.ok:
             scores = parse_judge_scores(jres.content, rec["score"]["dimensions"])
             rec["judge"] = {"model": judge_model, "raw": jres.content[:500]}

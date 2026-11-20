@@ -7,21 +7,27 @@ import re
 
 
 def extract_json(text: str) -> dict | None:
-    """Best-effort JSON extraction from a model response.
+    """Best-effort JSON *object* extraction from a model response.
 
-    Tries the whole string first, then the first {...} block found.
+    Tries the whole string first, then each `{` position with a strict
+    ``raw_decode`` — the old greedy first-brace-to-last-brace regex swallowed
+    several objects or trailing prose and failed to parse.
     """
     text = text.strip()
     try:
-        return json.loads(text)
+        v = json.loads(text)
+        if isinstance(v, dict):
+            return v
     except (json.JSONDecodeError, ValueError):
         pass
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if m:
+    dec = json.JSONDecoder()
+    for m in re.finditer(r"\{", text):
         try:
-            return json.loads(m.group(0))
-        except (json.JSONDecodeError, ValueError):
-            pass
+            obj, _ = dec.raw_decode(text[m.start():])
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            return obj
     return None
 
 
