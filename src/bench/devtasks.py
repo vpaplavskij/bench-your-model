@@ -635,6 +635,11 @@ def extract_code(text: str) -> str:
     m = re.search(r"```(?:python[0-9.]*|py)\s*\n(.*?)```", text, re.DOTALL | re.IGNORECASE)
     if m:
         return m.group(1).strip()
+    # Bare/other-language fence before the prose heuristic: a fenced snippet must
+    # not drag in prose lines that look like code (e.g. "x = 5" after the fence).
+    m = re.search(r"```[a-z]*\s*\n(.*?)```", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
     # Otherwise, if the whole thing looks like code (has a def/def-like line),
     # drop leading/trailing prose lines so exec() only sees code.
     if re.search(r"^\s*(def |class |\w+\s*=\s*lambda)", text, re.MULTILINE):
@@ -645,8 +650,4 @@ def extract_code(text: str) -> str:
         if idx:
             return "\n".join(lines[idx[0]:idx[-1] + 1]).strip()
         return text
-    # Last resort: first fenced block of any language.
-    m = re.search(r"```[a-z]*\s*\n(.*?)```", text, re.DOTALL)
-    if m:
-        return m.group(1).strip()
     return text
