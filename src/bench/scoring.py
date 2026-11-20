@@ -31,8 +31,7 @@ def extract_json(text: str) -> dict | None:
     return None
 
 
-def score_structured(task: dict, content: str, native_calls: list[dict] | None = None,
-                     agent_env: dict | None = None) -> dict:
+def score_structured(task: dict, content: str, native_calls: list[dict] | None = None) -> dict:
     """Score a structured task. Returns {"correct": bool, "detail": str}.
 
     For ``kind == "tools"`` tasks the calls come from ``native_calls`` (the
@@ -40,21 +39,12 @@ def score_structured(task: dict, content: str, native_calls: list[dict] | None =
     to parsing ``{"tool_calls": [...]}`` out of the text content, so servers
     without native tool support are still testable.
 
-    For ``kind == "agent"`` tasks the checker is ``check(env, content)`` — it
-    inspects the terminal state of the deterministic in-process environment
-    (``agent_env``) and the model's final answer text.
+    ``kind == "agent"`` tasks are scored by ``runner._run_agent_task`` (it owns
+    the multi-turn loop and the live env), never here.
     """
     check = task["check"]
     if task["kind"] == "agent":
-        try:
-            ok = bool(check(agent_env or {}, content))
-        except Exception as e:
-            return {"correct": False, "detail": f"checker error: {e}"}
-        detail = (
-            "agent workflow completed: final answer + environment state verified"
-            if ok else "agent workflow failed: environment state and/or final answer wrong"
-        )
-        return {"correct": ok, "detail": detail}
+        raise ValueError("agent tasks are scored by runner._run_agent_task, not score_structured")
     if task["kind"] == "tools":
         source = "native"
         calls = list(native_calls or [])
