@@ -198,8 +198,8 @@ def diagnose(points: list[PerfPoint]) -> list[str]:
     # 1) prefill vs decode share of total time (median run per point, averaged)
     shares: list[float] = []
     for p in ok_pts:
-        totals = sorted((r.total_ms or 0) for r in p.ok_runs)
-        r = p.ok_runs[totals.index(totals[len(totals) // 2])]  # median run by total_ms
+        ordered = sorted(p.ok_runs, key=lambda x: x.total_ms or 0)
+        r = ordered[len(ordered) // 2]  # median run by total_ms
         if r.ttft_ms and r.total_ms > r.ttft_ms:
             shares.append(r.ttft_ms / r.total_ms)
     if shares:
