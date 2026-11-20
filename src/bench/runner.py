@@ -141,20 +141,21 @@ def _run_agent_task(client: BenchClient, cfg: RunConfig, task: dict) -> dict:
             call_seq += 1
             name = call.get("name", "")
             args = call.get("arguments") or {}
-            if args.get("_raw_arguments"):
-                # arguments failed to parse client-side; keep raw text.
+            raw = args.get("_raw_arguments")
+            if raw is not None:
+                # F5: streamed arguments were invalid JSON. Do not run the tool
+                # ({} would be an action the model never asked for); hand the
+                # error back and echo the model's raw string verbatim.
+                result = {"error": f"invalid JSON arguments: {raw[:200]}"}
+            else:
                 try:
-                    args = json.loads(args["_raw_arguments"])
-                except (ValueError, TypeError):
-                    args = {}
-            try:
-                result = task["step"](env, name, args) if env is not None else {"error": "no env"}
-            except Exception as e:  # noqa: BLE001 - a bad tool argument (e.g. int("ten")) is a task failure, not a run abort
-                result = {"error": f"tool call failed: {type(e).__name__}: {e}"}
+                    result = task["step"](env, name, args) if env is not None else {"error": "no env"}
+                except Exception as e:  # noqa: BLE001 - a bad tool argument (e.g. int("ten")) is a task failure, not a run abort
+                    result = {"error": f"tool call failed: {type(e).__name__}: {e}"}
             assistant_calls.append({
                 "id": call_id,
                 "type": "function",
-                "function": {"name": name, "arguments": json.dumps(args)},
+                "function": {"name": name, "arguments": raw if raw is not None else json.dumps(args)},
             })
             tool_results.append({
                 "role": "tool",
