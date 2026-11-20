@@ -74,6 +74,12 @@ Every new run records the settings block in its **run documents** —
 A field you omitted on the CLI is stored as `null` and rendered as
 `not recorded`.
 
+Each document also carries `meta.harness_rev` — an integer stamp of the
+harness itself (see `src/bench/version.py`), bumped whenever scoring or metric
+definitions change. Runs recorded before stamping exist are treated as rev 1;
+`compare.md` marks rows whose rev differs from the current harness † (not
+comparable). This is harness metadata, not a server setting.
+
 ## 4. What each run document must state
 
 Each standard's markdown (`quality.md`, `perf.md`, `dev.md`) starts with the
