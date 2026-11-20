@@ -83,8 +83,9 @@ Measures **where the time goes** so you can find the bottleneck.
 For each prompt size in `--prompt-sizes` (default `128,512,1024,2048`):
 1. warmup run(s) (discarded — warms server caches / KV pool),
 2. a settle pause,
-3. N measurement runs with a **fixed output length** (`--output-tokens`,
-   default 256), so prefill and decode phases are cleanly separated.
+3. N measurement runs with a **capped output length** (`--output-tokens`,
+   default 256 — an upper bound, see Notes), so prefill and decode phases are
+   cleanly separated.
 
 ### Metrics
 | Metric | Meaning |
@@ -139,7 +140,8 @@ Add tasks in `src/bench/tasks.py` — a task is just a dict.
 uv run bench quality --model <name> --endpoint http://localhost:8080/v1 --suite all
 ```
 
-Useful flags: `--timeout 300`, `--max-tokens 4096`,
+Useful flags: `--timeout 300` (seconds between received bytes — a read-inactivity
+timeout, not a total per-request limit), `--max-tokens 4096`,
 `--temperature 0`, `--task s1 --task o2` (subset), `--root results`.
 
 Output: `results/<model>-<QUANT>/<run-ts>/quality.json` + `quality.md`.
@@ -214,8 +216,10 @@ recorded.
 ---
 
 ## Notes
-- The speed harness requests **strict** output length via `max_tokens`; the
-  quality harness requests strict JSON-schema output where applicable. If your
+- The speed harness requests **up to** `--output-tokens` tokens via `max_tokens`
+  (an upper bound — a model can stop earlier; the prompt asks for a long
+  continuation so most models reach the cap). The quality harness requests
+  strict JSON-schema output where applicable. If your
   server doesn't support `response_format`, structured tasks fall back to
   best-effort JSON extraction (still scored).
 - Prompt sizes are approximate (1 token/word filler text); actual prompt token

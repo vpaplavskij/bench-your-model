@@ -89,7 +89,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Model name to send in requests (see /v1/models)")
     p.add_argument("--api-key", default=os.environ.get("BENCH_API_KEY", "none"))
     p.add_argument("--timeout", type=float, default=300.0,
-                   help="Per-request timeout in seconds (default: 300)")
+                   help="seconds to wait between received bytes — a read-inactivity "
+                        "timeout, not a total per-request limit (default: 300)")
     p.add_argument("--max-tokens", type=int, default=4096)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--judge-model", default=None,

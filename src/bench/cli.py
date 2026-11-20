@@ -42,7 +42,9 @@ def _perf_parser() -> "argparse.ArgumentParser":  # noqa: F821
     p.add_argument("--endpoint", default=os.environ.get("BENCH_ENDPOINT", "http://localhost:8080/v1"))
     p.add_argument("--model", required=True)
     p.add_argument("--api-key", default=os.environ.get("BENCH_API_KEY", "none"))
-    p.add_argument("--timeout", type=float, default=300.0)
+    p.add_argument("--timeout", type=float, default=300.0,
+                   help="seconds to wait between received bytes — a read-inactivity "
+                        "timeout, not a total per-request limit (default: 300)")
     p.add_argument("--prompt-sizes", default="128,512,1024,2048",
                    help="comma-separated prompt sizes in tokens (default: 128,512,1024,2048)")
     p.add_argument("--output-tokens", type=int, default=256,
@@ -112,7 +114,9 @@ def _dev_parser():
     p.add_argument("--endpoint", default=os.environ.get("BENCH_ENDPOINT", "http://localhost:8080/v1"))
     p.add_argument("--model", required=True)
     p.add_argument("--api-key", default=os.environ.get("BENCH_API_KEY", "none"))
-    p.add_argument("--timeout", type=float, default=300.0)
+    p.add_argument("--timeout", type=float, default=300.0,
+                   help="seconds to wait between received bytes — a read-inactivity "
+                        "timeout, not a total per-request limit (default: 300)")
     p.add_argument("--max-tokens", type=int, default=4096)
     p.add_argument("--task", action="append", default=[], metavar="ID",
                    help="run only specific dev task IDs (repeatable), e.g. --task d1")
@@ -186,7 +190,9 @@ def _all_parser():
     p.add_argument("--endpoint", default=os.environ.get("BENCH_ENDPOINT", "http://localhost:8080/v1"))
     p.add_argument("--model", required=True)
     p.add_argument("--api-key", default=os.environ.get("BENCH_API_KEY", "none"))
-    p.add_argument("--timeout", type=float, default=300.0)
+    p.add_argument("--timeout", type=float, default=300.0,
+                   help="seconds to wait between received bytes — a read-inactivity "
+                        "timeout, not a total per-request limit (default: 300)")
     p.add_argument("--max-tokens", type=int, default=4096)
     p.add_argument("--temperature", type=float, default=0.0,
                    help="sampling temperature for quality tasks (perf/dev run at 0.0)")
