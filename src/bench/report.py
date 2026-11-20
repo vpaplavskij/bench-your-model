@@ -54,14 +54,19 @@ def now_ts() -> str:
 
 
 def run_ts(root: str | Path, model: str, quant: str | None = None) -> str:
-    """Fresh run-folder timestamp; never reuses an existing folder (same-second re-runs)."""
-    ts = now_ts()
+    """Fresh run-folder timestamp; reserves the folder atomically (mkdir with
+    exist_ok=False) so two concurrent runs of the same model+quant never share
+    one folder — a collision retries with the -N suffix."""
     d = model_dir(root, model, quant)
+    ts = now_ts()
     n = 1
-    while (d / ts).exists():
-        n += 1
-        ts = f"{now_ts()}-{n}"
-    return ts
+    while True:
+        try:
+            (d / ts).mkdir(parents=True, exist_ok=False)
+            return ts
+        except FileExistsError:
+            n += 1
+            ts = f"{now_ts()}-{n}"
 
 
 def write_standard(
