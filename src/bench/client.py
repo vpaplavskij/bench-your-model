@@ -262,6 +262,15 @@ class BenchClient:
                         chunk = json.loads(payload)
                     except json.JSONDecodeError:
                         continue
+                    # Some servers (llama.cpp among them) answer HTTP 200 and
+                    # send {"error": {...}} mid-stream: that is a failed
+                    # request, not a successful empty answer.
+                    if isinstance(chunk, dict) and chunk.get("error"):
+                        err = chunk["error"]
+                        res.error = "stream error: " + (
+                            err.get("message", str(err)) if isinstance(err, dict) else str(err))
+                        res.total_ms = (time.perf_counter() - t_start) * 1000
+                        return res
                     now = time.perf_counter() - t_start
                     choice = (chunk.get("choices") or [{}])[0]
                     delta = choice.get("delta") or {}
