@@ -72,6 +72,16 @@ class PerfRun:
     stalls: int = 0
     decode_tps: float | None = None
     prefill_tps: float | None = None
+    # Thinking-inclusive variants: reasoning + content chunks over the window
+    # from the first token (content-only keys above keep their old meaning).
+    decode_tps_all: float | None = None
+    itl_mean_all_ms: float | None = None
+    itl_p95_all_ms: float | None = None
+    itl_max_all_ms: float | None = None
+    stalls_all: int = 0
+    reasoning_chunks: int = 0
+    content_chunks: int = 0
+    finish_reason: str | None = None
 
 
 @dataclass
@@ -102,6 +112,9 @@ def _time_request(client: BenchClient, prompt: str, max_tokens: int) -> PerfRun:
     run.total_ms = res.total_ms
     run.prompt_tokens = res.prompt_tokens
     run.completion_tokens = res.completion_tokens
+    run.reasoning_chunks = res.reasoning_chunks
+    run.content_chunks = res.stream_chunks
+    run.finish_reason = res.raw_finish_reason
     if sm is not None:
         run.itl_mean_ms = sm.inter_token_ms()
         run.itl_p95_ms = sm.p95_itl_ms()
@@ -112,13 +125,24 @@ def _time_request(client: BenchClient, prompt: str, max_tokens: int) -> PerfRun:
     # thinking tokens and would inflate decode_tps on thinking servers.
     # Prefill uses time to the FIRST token (reasoning included): on thinking
     # servers ttft_ms is time to first ANSWER token, which understates prefill.
+    # Prefill is independent of content TTFT: a thinking model that spends the
+    # whole output cap on reasoning has no content chunks but a real prefill.
     prefill_ttft = res.ttft_first_token_ms or res.ttft_ms
+    if res.prompt_tokens and prefill_ttft:
+        run.prefill_tps = res.prompt_tokens / (prefill_ttft / 1000.0)
     if res.ttft_ms and res.total_ms > res.ttft_ms:
         n = res.stream_chunks
         if n >= 2:
             run.decode_tps = (n - 1) / ((res.total_ms - res.ttft_ms) / 1000.0)
-        if res.prompt_tokens and prefill_ttft:
-            run.prefill_tps = res.prompt_tokens / (prefill_ttft / 1000.0)
+    # Thinking-inclusive decode/ITL over reasoning + content arrivals.
+    am = res.all_stream_metrics
+    n_all = am.n_tokens if am else 0
+    if res.ttft_first_token_ms and n_all >= 2 and res.total_ms > res.ttft_first_token_ms:
+        run.decode_tps_all = (n_all - 1) / ((res.total_ms - res.ttft_first_token_ms) / 1000.0)
+        run.itl_mean_all_ms = am.inter_token_ms()
+        run.itl_p95_all_ms = am.p95_itl_ms()
+        run.itl_max_all_ms = am.max_itl_ms()
+        run.stalls_all = am.stall_count_ms()
     return run
 
 
@@ -175,7 +199,7 @@ def run_perf_sweep(
         points.append(point)
 
     client.close()
-    return _assemble(cfg, server_info, points, output_tokens)
+    return _assemble(cfg, server_info, points, output_tokens, warmup_runs)
 
 
 def _med(vals: list) -> float | None:
@@ -194,14 +218,19 @@ def diagnose(points: list[PerfPoint]) -> list[str]:
     ok_pts = [p for p in points if p.ok_runs]
     if not ok_pts:
         return ["no successful runs — nothing to diagnose"]
+    has_reasoning = any(r.reasoning_chunks for p in ok_pts for r in p.ok_runs)
 
     # 1) prefill vs decode share of total time (median run per point, averaged)
     shares: list[float] = []
     for p in ok_pts:
         ordered = sorted(p.ok_runs, key=lambda x: x.total_ms or 0)
         r = ordered[len(ordered) // 2]  # median run by total_ms
-        if r.ttft_ms and r.total_ms > r.ttft_ms:
-            shares.append(r.ttft_ms / r.total_ms)
+        # Thinking time belongs to generation, not prefill: the share is the
+        # time to the FIRST token over wall time, else thinking is misreported
+        # as "prefill-dominated".
+        pref = r.ttft_first_token_ms or r.ttft_ms
+        if pref and r.total_ms > pref:
+            shares.append(pref / r.total_ms)
     if shares:
         avg_share = statistics.mean(shares)
         if avg_share > 0.6:
@@ -224,10 +253,13 @@ def diagnose(points: list[PerfPoint]) -> list[str]:
             )
 
     # 2) decode speed vs prompt size -> KV/context pressure
+    # On thinking servers the answer-only window may be tiny (or empty): use
+    # the thinking-inclusive speed for these findings.
     if len(ok_pts) >= 2:
         first, last = ok_pts[0], ok_pts[-1]
-        d_first = _med([r.decode_tps for r in first.ok_runs])
-        d_last = _med([r.decode_tps for r in last.ok_runs])
+        dec = (lambda r: r.decode_tps_all) if has_reasoning else (lambda r: r.decode_tps)
+        d_first = _med([dec(r) for r in first.ok_runs])
+        d_last = _med([dec(r) for r in last.ok_runs])
         if d_first and d_last and d_last < d_first * 0.85:
             out.append(
                 f"KV/CONTEXT PRESSURE: decode speed drops "
@@ -242,11 +274,15 @@ def diagnose(points: list[PerfPoint]) -> list[str]:
                 f"({d_first:.0f} -> {d_last:.0f} tok/s) — no strong KV pressure at these lengths."
             )
 
-    # 3) ITL spikes / stalls -> server-side hiccups
-    worst_stalls = max((max((r.stalls for r in p.ok_runs), default=0) for p in ok_pts), default=0)
-    p95s = [_med([r.itl_p95_ms for r in p.ok_runs]) for p in ok_pts]
+    # 3) ITL spikes / stalls -> server-side hiccups (thinking-inclusive when
+    # reasoning was streamed: the answer phase alone may be a handful of chunks)
+    stall_attr = "stalls_all" if has_reasoning else "stalls"
+    itl_p95_attr = "itl_p95_all_ms" if has_reasoning else "itl_p95_ms"
+    itl_mean_attr = "itl_mean_all_ms" if has_reasoning else "itl_mean_ms"
+    worst_stalls = max((max((getattr(r, stall_attr) for r in p.ok_runs), default=0) for p in ok_pts), default=0)
+    p95s = [_med([getattr(r, itl_p95_attr) for r in p.ok_runs]) for p in ok_pts]
     p95s = [v for v in p95s if v is not None]
-    means = [_med([r.itl_mean_ms for r in p.ok_runs]) for p in ok_pts]
+    means = [_med([getattr(r, itl_mean_attr) for r in p.ok_runs]) for p in ok_pts]
     means = [v for v in means if v is not None]
     if worst_stalls > 0:
         out.append(
@@ -263,12 +299,24 @@ def diagnose(points: list[PerfPoint]) -> list[str]:
     else:
         out.append("ITL stable: no stalls > 500ms and p95 within ~2.5x of the mean — smooth generation.")
 
+    # 4) thinking consumed the whole output cap -> no answer was ever generated
+    spent = sum(1 for p in ok_pts for r in p.ok_runs
+                if r.reasoning_chunks and not r.content_chunks)
+    if spent:
+        n_ok = sum(len(p.ok_runs) for p in ok_pts)
+        out.append(
+            f"{spent} of {n_ok} runs spent the entire --output-tokens budget on "
+            "reasoning (no answer tokens). Raise --output-tokens or run the server "
+            "with reasoning budget 0 for a clean decode measurement."
+        )
+
     # Per-size detail is already in the "Per prompt size" table (render_perf_markdown),
     # so it is not repeated here.
     return out
 
 
-def _assemble(cfg, server_info: dict, points: list[PerfPoint], output_tokens: int) -> dict:
+def _assemble(cfg, server_info: dict, points: list[PerfPoint], output_tokens: int,
+              warmup_runs: int = 1) -> dict:
     all_ok = [r for p in points for r in p.ok_runs]
     doc_points = []
     for p in points:
@@ -284,14 +332,23 @@ def _assemble(cfg, server_info: dict, points: list[PerfPoint], output_tokens: in
             "total_ms": {"mean": _mean([r.total_ms for r in ok]), "median": _med([r.total_ms for r in ok])},
             "prefill_tps": {"mean": _mean([r.prefill_tps for r in ok]), "median": _med([r.prefill_tps for r in ok])},
             "decode_tps": {"mean": _mean([r.decode_tps for r in ok]), "median": _med([r.decode_tps for r in ok])},
+            "decode_tps_all": {"mean": _mean([r.decode_tps_all for r in ok]), "median": _med([r.decode_tps_all for r in ok])},
             "itl_mean_ms": {"mean": _mean([r.itl_mean_ms for r in ok]), "median": _med([r.itl_mean_ms for r in ok])},
             "itl_p95_ms": _med([r.itl_p95_ms for r in ok]),
             "itl_max_ms": max((r.itl_max_ms for r in ok if r.itl_max_ms is not None), default=None),
             "stalls_total": sum(r.stalls for r in ok),
+            "itl_mean_all_ms": {"mean": _mean([r.itl_mean_all_ms for r in ok]), "median": _med([r.itl_mean_all_ms for r in ok])},
+            "itl_p95_all_ms": _med([r.itl_p95_all_ms for r in ok]),
+            "itl_max_all_ms": max((r.itl_max_all_ms for r in ok if r.itl_max_all_ms is not None), default=None),
+            "stalls_all_total": sum(r.stalls_all for r in ok),
+            "reasoning_chunks_total": sum(r.reasoning_chunks for r in ok),
+            "content_chunks_total": sum(r.content_chunks for r in ok),
         })
 
     ttft_all = _med([r.ttft_ms for r in all_ok])
+    ttft_first_all = _med([r.ttft_first_token_ms for r in all_ok])
     decode_all = _med([r.decode_tps for r in all_ok])
+    decode_all_toks = _med([r.decode_tps_all for r in all_ok])
     prefill_all = _med([r.prefill_tps for r in all_ok])
 
     return {
@@ -302,6 +359,7 @@ def _assemble(cfg, server_info: dict, points: list[PerfPoint], output_tokens: in
             "endpoint": cfg.endpoint,
             "output_tokens": output_tokens,
             "measure_runs": len(points[0].runs) if points else 0,
+            "warmup_runs": warmup_runs,
             # How the SERVER serves the model (Unsloth Studio / llama.cpp), not
             # the agent harness. See REPORT_SPEC.md.
             "settings": cfg.settings(),
@@ -310,7 +368,9 @@ def _assemble(cfg, server_info: dict, points: list[PerfPoint], output_tokens: in
         "points": doc_points,
         "headline": {
             "ttft_ms_median": ttft_all,
+            "ttft_first_token_ms_median": ttft_first_all,
             "decode_tps_median": decode_all,
+            "decode_tps_all_median": decode_all_toks,
             "prefill_tps_median": prefill_all,
         },
         "diagnosis": diagnose(points),
@@ -322,16 +382,25 @@ def render_perf_markdown(doc: dict) -> str:
     h = doc["headline"]
 
     plain: list[str] = []
+    reasoning = sum(pt.get("reasoning_chunks_total") or 0 for pt in doc["points"])
     if h.get("prefill_tps_median") is not None:
         plain.append(f"- It **reads** your question at about **{fmt_tps(h['prefill_tps_median'])}** "
                      f"and **writes** the answer at about **{fmt_tps(h['decode_tps_median'])}**.")
     else:
         plain.append("- Read speed could not be measured (server did not report prompt size).")
+    if reasoning:
+        # Thinking servers spend most generation time on reasoning_content: the
+        # answer-only decode number can be tiny or missing, so show the total.
+        plain.append(f"- Writes **incl. thinking** at about **{fmt_tps(h.get('decode_tps_all_median'))}** "
+                     f"({reasoning} thinking token(s) streamed across the runs).")
     if h.get("ttft_ms_median") is not None:
         plain.append(f"- First word arrives after **{fmt_ms(h['ttft_ms_median'])}** "
                      f"(median across all test lengths).")
+    if reasoning and h.get("ttft_first_token_ms_median") is not None:
+        plain.append(f"- First token (thinking included) arrives after **{fmt_ms(h['ttft_first_token_ms_median'])}** "
+                     f"(median across all test lengths).")
     plain.append(f"- Every answer was capped at {m['output_tokens']} tokens; "
-                 f"each size tested {m['measure_runs']} times (plus 1 warm-up, discarded).")
+                 f"each size tested {m['measure_runs']} times (plus {m.get('warmup_runs', 1)} warm-up, discarded).")
     _p_total = sum(
         float((pt.get("total_ms") or {}).get("mean")) * int(pt.get("runs_ok") or 0)
         for pt in doc["points"] if (pt.get("total_ms") or {}).get("mean") is not None and pt.get("runs_ok")

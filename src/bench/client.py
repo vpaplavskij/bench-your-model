@@ -25,6 +25,8 @@ class ChatResult:
     completion_tokens: int | None = None
     stream_chunks: int = 0
     stream_metrics: "StreamMetrics | None" = None
+    reasoning_chunks: int = 0            # reasoning/thinking deltas streamed
+    all_stream_metrics: "StreamMetrics | None" = None  # reasoning + content samples
 
     @property
     def tokens_per_s(self) -> float | None:
@@ -87,6 +89,19 @@ class StreamMetrics:
             1 for a, b in zip(self.samples, self.samples[1:])
             if (b.t - a.t) * 1000.0 > threshold_ms
         )
+
+
+# Servers name their thinking stream differently: llama.cpp uses
+# reasoning_content, vLLM/OpenRouter use reasoning, some use thinking.
+_REASONING_KEYS = ("reasoning_content", "reasoning", "thinking")
+
+
+def _delta_reasoning(delta: dict) -> str:
+    for k in _REASONING_KEYS:
+        v = delta.get(k)
+        if isinstance(v, str) and v:
+            return v
+    return ""
 
 
 def _merge_tool_call(index: dict[int, dict], tc: dict) -> None:
@@ -217,6 +232,7 @@ class BenchClient:
 
         res = ChatResult(ok=False)
         samples: list[StreamSample] = []
+        all_samples: list[StreamSample] = []  # reasoning + content arrivals
         t_start = time.perf_counter()
         first_token_at: float | None = None
         first_content_at: float | None = None
@@ -256,14 +272,20 @@ class BenchClient:
                         if first_token_at is None:
                             first_token_at = now
                         samples.append(StreamSample(t=now))
+                        all_samples.append(StreamSample(t=now))
                         pieces.append(token)
                         res.stream_chunks += 1
-                    elif delta.get("reasoning_content") and first_token_at is None:
-                        # Thinking models stream reasoning_content first: it IS
-                        # the first token. ttft_ms stays content-only (the decode
-                        # window must exclude thinking), but ttft_first_token_ms
-                        # records the real prefill end for prefill tok/s.
-                        first_token_at = now
+                    else:
+                        reasoning = _delta_reasoning(delta)
+                        if reasoning:
+                            # Thinking models stream reasoning first: it IS the
+                            # first token. ttft_ms stays content-only, but
+                            # ttft_first_token_ms records the real prefill end,
+                            # and all_samples measures the thinking phase too.
+                            res.reasoning_chunks += 1
+                            if first_token_at is None:
+                                first_token_at = now
+                            all_samples.append(StreamSample(t=now))
                     tc_deltas = delta.get("tool_calls") or []
                     if tc_deltas:
                         # A tool-call delta IS the first token; tool-only answers
@@ -299,4 +321,5 @@ class BenchClient:
         if first_content_at is not None:
             res.ttft_ms = first_content_at * 1000
         res.stream_metrics = StreamMetrics(samples)
+        res.all_stream_metrics = StreamMetrics(all_samples)
         return res

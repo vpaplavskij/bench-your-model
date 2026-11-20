@@ -89,11 +89,11 @@ For each prompt size in `--prompt-sizes` (default `128,512,1024,2048`):
 ### Metrics
 | Metric | Meaning |
 |---|---|
-| **TTFT** (ms) | time to first **content/tool** chunk (first token incl. thinking is also recorded; used for prefill) |
-| **Prefill speed** (tok/s) | prompt_tokens / first-token time — how fast the prompt is processed (measured prompts get a cache-busting nonce) |
-| **Decode speed** (tok/s) | (N−1) / (total − TTFT) — autoregressive generation speed |
-| **ITL mean / p95 / max** (ms) | inter-token latency: stability of generation |
-| **Stalls** (>500 ms gaps) | server hiccups (CPU offload, page faults, GC, OOM) |
+| **TTFT** (ms) | time to first **content/tool** chunk (`ttft_ms`); first token incl. thinking is also recorded as `ttft_first_token_ms` and used for prefill |
+| **Prefill speed** (tok/s) | prompt_tokens / first-token time (incl. thinking) — how fast the prompt is processed (measured prompts get a cache-busting nonce); independent of whether any answer tokens arrived |
+| **Decode speed** (tok/s) | (N−1) / (total − TTFT) over **content chunks only**; `decode_tps_all` is the thinking-inclusive speed over reasoning + content chunks (the real generation rate on thinking servers) |
+| **ITL mean / p95 / max** (ms) | inter-token latency: stability of generation; `*_all` variants cover the reasoning phase too |
+| **Stalls** (>500 ms gaps) | server hiccups (CPU offload, page faults, GC, OOM); `stalls_all` counts gaps incl. thinking |
 | **Total wall time** (ms) | full request time per run |
 
 ### Bottleneck diagnosis (automatic)
