@@ -36,13 +36,21 @@ from .textutil import strip_think
 # Top-level modules blocked in the exec namespace: fs/net/subprocess access.
 # The dev tasks and their checkers only need json/re/math/collections/itertools.
 # shortcut: blocks imports + open(), not attribute-level escapes (e.g. builtins
-# reached via gc); upgrade to a real sandbox if the harness ever faces remote servers.
+# reached via gc or __subclasses__) — documented in README/AGENTS; upgrade to a
+# subprocess sandbox with rlimits (brief C4) if the harness ever faces remote servers.
 _BLOCKED_MODULES = frozenset({"os", "sys", "socket", "subprocess", "shutil", "tempfile",
                               "http", "urllib", "pathlib", "ctypes", "pty", "signal",
                               "multiprocessing", "threading",
                               # io/builtins/importlib/posix were the escape hatch:
                               # io.open and builtins.open bypassed the popped open().
-                              "io", "builtins", "importlib", "posix"})
+                              "io", "builtins", "importlib", "posix",
+                              # second-wave escapes (brief C4 fallback): async/task
+                              # spawning, module runners, deserialization payloads,
+                              # interpreter debugging, and less-common fs/net modules.
+                              "asyncio", "concurrent", "_thread", "runpy", "pickle",
+                              "marshal", "code", "pdb", "gc", "glob", "fileinput",
+                              "zipfile", "shelve", "dbm", "ssl", "smtplib", "ftplib",
+                              "webbrowser"})
 
 # SIGALRM guard (Linux, single-threaded main loop): an infinite loop in
 # model-written code would otherwise hang the whole bench run forever.

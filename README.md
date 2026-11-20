@@ -225,7 +225,9 @@ recorded.
 - Prompt sizes are approximate (1 token/word filler text); actual prompt token
   counts are taken from the server's `usage` and reported per point.
 - The dev harness executes model code in a guarded `exec` namespace — imports
-  of filesystem/network/subprocess modules (os, socket, subprocess, shutil,
-  pathlib, …) and `open()` are blocked, json/re/collections stay available,
-  and a SIGALRM watchdog kills hangs. Fine for benchmarking trusted local
-  models; do not point it at untrusted remote endpoints.
+  of filesystem/network/subprocess/threading/async modules (os, socket,
+  subprocess, shutil, pathlib, asyncio, pickle, …) and `open()` are blocked,
+  json/re/collections stay available, and a SIGALRM watchdog kills hangs.
+  This is a blocklist, not a jail: attribute-level escapes (e.g. reaching
+  builtins through `__subclasses__`) remain possible. Fine for benchmarking
+  trusted local models; do not point it at untrusted remote endpoints.
