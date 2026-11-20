@@ -143,7 +143,8 @@ def _run_dev(argv: list[str]) -> int:
         quant=args.quant)
 
     s = doc["summary"]
-    print(f"\nAccuracy: {s['passed']}/{s['n_tasks']} ({pct(s['accuracy'])})  |  "
+    scored = s["n_tasks"] - s["checker_errors"]  # checker-load failures are harness faults, not scored
+    print(f"\nAccuracy: {s['passed']}/{scored} ({pct(s['accuracy'])})  |  "
           f"runtime errors: {s['runtime_errors']}  |  composite score: {s['composite_score']}/100")
     if doc["error_log"]:
         print(f"WARNING: {len(doc['error_log'])} dev task(s) failed/errored — read dev.json, "

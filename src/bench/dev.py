@@ -116,7 +116,7 @@ class DevTaskResult:
     passed: bool = False
     checker_detail: str = ""
     runtime_error: str | None = None      # error from executing the model's code
-    checker_error: str | None = None      # harness checker bug — never penalizes the model
+    checker_error: str | None = None      # harness fault (checker failed to load) — never penalizes the model
     total_ms: float = 0.0                 # whole task wall time (request + check)
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
@@ -155,7 +155,15 @@ def _run_dev_task(client: BenchClient, task: dict) -> DevTaskResult:
         rec.passed = False
         rec.checker_detail = f"code failed to import/run: {run_res['error']}"
     else:
-        check_fn = _load_checker(task["checker_src"])
+        # Genuine harness faults only (checker source won't compile / no check())
+        # may mark a task as a checker error; anything raised WHILE checking is
+        # the model's output breaking the check and must be scored as a FAIL.
+        try:
+            check_fn = _load_checker(task["checker_src"])
+        except Exception as e:  # noqa: BLE001 - typo in checker src: record, don't crash the run
+            rec.checker_error = f"checker load failed: {type(e).__name__}: {e}"
+            rec.total_ms = (time.perf_counter() - t0) * 1000
+            return rec
 
         def _run(src: str) -> dict:
             r = run_code(src)
@@ -182,19 +190,19 @@ def _run_dev_task(client: BenchClient, task: dict) -> DevTaskResult:
             # a scored signal, not a harness bug.
             rec.runtime_error = str(e)
             rec.checker_detail = str(e)
-        except Exception as e:  # noqa: BLE001 - checker bug shouldn't crash the run
+        except Exception as e:  # noqa: BLE001 - never exclude a wrong answer from scoring
+            detail = f"{type(e).__name__}: {e}"
             frames = traceback.extract_tb(e.__traceback__)
+            rec.passed = False
             if any(f.filename == "<devtask>" for f in frames):
-                # The exception came from the model's own code (frames compiled
-                # as <devtask>): that's a runtime error of the model's solution,
-                # so it must be scored against the model, not excluded as a
-                # harness checker error (which inflated accuracy).
-                rec.runtime_error = f"{type(e).__name__}: {e}"
-                rec.checker_detail = f"model code raised during checks: {type(e).__name__}: {e}"
+                # Raised inside the model's own code: scored runtime error (-5).
+                rec.runtime_error = detail
+                rec.checker_detail = f"model code raised during checks: {detail}"
             else:
-                rec.passed = False
-                rec.checker_error = f"checker error (harness): {type(e).__name__}: {e}"
-                rec.checker_detail = rec.checker_error
+                # Wrong return type etc. (e.g. missing `return` -> None): the
+                # model's output broke the checks in the checker's own frame —
+                # a plain FAIL, still counted against the model.
+                rec.checker_detail = f"model output broke the checks (counted as FAIL): {detail}"
 
     rec.total_ms = (time.perf_counter() - t0) * 1000
     return rec
