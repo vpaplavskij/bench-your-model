@@ -50,6 +50,7 @@ results/<MODEL>-<QUANT>/<run-ts>/    # <run-ts> = UTC timestamp; re-runs append
 - Quality task kinds: `tools` (native function calling, scored exactly; falls back to parsing `{"tool_calls": [...]}` from text if the server lacks native support), `agent` (multi-turn: harness drives the tool loop against `task["env_factory"]()` env, scored on final answer AND terminal env state), structured/open (JSON schema + exact match / LLM-judge rubric).
 - Dev tasks need a `prompt` + `checker_src` string defining `check(code_src, run) -> {"pass": bool, "detail": str}`.
 - **Keep task ids and names stable** so historical cross-run comparisons stay valid — fix tasks in place, don't renumber.
+- `s6` (quality) and `d6` (dev) are the same clock problem on purpose: the same prompt is scored under two standards. Do not de-duplicate or renumber.
 - Prompt wording is load-bearing for the mock: `_detect` matches substrings like `"17 * 23"`, `"shelves"`, `"book a flight"`, `"gains 5 minutes every day"`, `"train ride costs"`, `"Great Barrier Reef"`, `"exactly 5 benefits"`, `"delayed by one week"`, dev function names. Editing a prompt (or its checker) silently breaks `bench mock` for that task.
 
 ## Docs hierarchy (read before acting)

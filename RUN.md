@@ -11,7 +11,7 @@ Do not search, explore, or read source code. Execute one command, wait, then rea
 |---|---|
 | **MODEL** | The model name/alias of the server under test (e.g. from Unsloth Studio or the server's `/v1/models`). |
 | **ENDPOINT** | Base URL of that server, e.g. `http://127.0.0.1:PORT/v1`. |
-| **API KEY** | The key the server expects (from its auth file / Studio). |
+| **API KEY** | Export it as `BENCH_API_KEY` before running (`export BENCH_API_KEY=...`); omit if the server needs no key. |
 
 **Server settings** — these must come from how the inference server
 (Unsloth Studio / llama.cpp) is actually started, **not** from any agent or
