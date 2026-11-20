@@ -50,15 +50,22 @@ def run_benchmark(cfg: RunConfig) -> dict:
     # A --judge-model different from the model under test needs its own client;
     # otherwise the model under test would judge itself even when the flag is set.
     judge_client = client
+    judge_available = True
     if cfg.judge_model and cfg.judge_model != cfg.model:
-        judge_client = BenchClient(
-            endpoint=cfg.endpoint, model=cfg.judge_model, api_key=cfg.api_key,
-            timeout_s=cfg.timeout_s, max_tokens=cfg.max_tokens, temperature=0.0,
-        )
+        avail = server_info.get("available_models")
+        if avail and cfg.judge_model not in avail:
+            judge_available = False
+            print(f"WARNING: --judge-model '{cfg.judge_model}' is not served by "
+                  f"{cfg.endpoint} — open tasks cannot be judged.", file=sys.stderr)
+        else:
+            judge_client = BenchClient(
+                endpoint=cfg.endpoint, model=cfg.judge_model, api_key=cfg.api_key,
+                timeout_s=cfg.timeout_s, max_tokens=cfg.max_tokens, temperature=0.0,
+            )
 
     print(f"Running {len(tasks)} task(s) against {cfg.endpoint} (model={cfg.model})")
     for task in tasks:
-        rec = _run_task(client, cfg, task, judge_model, judge_client)
+        rec = _run_task(client, cfg, task, judge_model, judge_client, judge_available)
         records.append(rec)
         status = "OK " if rec["request_ok"] else "ERR"
         score = rec.get("score") or {}  # absent when the request failed
@@ -70,6 +77,13 @@ def run_benchmark(cfg: RunConfig) -> dict:
             score_txt = f"judge={avg:.2f}"
         print(f"  [{status}] {task['id']} {task['name']}: ttft={fmt_ms(rec['ttft_ms'])} "
               f"total={fmt_ms(rec['total_ms'])} {score_txt}")
+
+    unjudged = [r for r in records if r["suite"] == "open" and r["request_ok"]
+                and not (r.get("score") or {}).get("scores")]
+    if unjudged:
+        err = (unjudged[0].get("judge") or {}).get("error") or "judge output could not be parsed"
+        print(f"WARNING: {len(unjudged)} open task(s) could not be judged — {err}. "
+              "Their writing-quality scores are missing, not zero.", file=sys.stderr)
 
     client.close()
     if judge_client is not client:
@@ -198,7 +212,7 @@ def _run_agent_task(client: BenchClient, cfg: RunConfig, task: dict) -> dict:
 
 
 def _run_task(client: BenchClient, cfg: RunConfig, task: dict, judge_model: str,
-              judge_client: BenchClient | None = None) -> dict:
+              judge_client: BenchClient | None = None, judge_available: bool = True) -> dict:
     # Agent tasks run their own multi-turn loop.
     if task.get("kind") == "agent":
         return _run_agent_task(client, cfg, task)
@@ -239,16 +253,24 @@ def _run_task(client: BenchClient, cfg: RunConfig, task: dict, judge_model: str,
         rec["score"] = score_structured(task, answer, native_calls=res.tool_calls)
     elif task["suite"] == "open" and res.ok:
         rec["score"] = score_open(task, answer)
-        # LLM judge (skipped if the model under test is not usable as judge)
-        jres = (judge_client or client).chat(build_judge_messages(task, answer))
-        if jres.ok:
-            scores = parse_judge_scores(jres.content, rec["score"]["dimensions"])
-            rec["judge"] = {"model": judge_model, "raw": jres.content[:500]}
-            if scores:
-                rec["score"]["scores"] = scores
-                rec["score"]["detail"] = "judged"
+        if not judge_available:
+            rec["judge"] = {"model": judge_model,
+                            "error": f"judge model '{judge_model}' not served by endpoint"}
+        elif judge_client is None:
+            rec["judge"] = {"model": judge_model, "error": "no judge client"}
         else:
-            rec["judge"] = {"model": judge_model, "error": jres.error}
+            # LLM judge (skipped if the model under test is not usable as judge)
+            jres = judge_client.chat(build_judge_messages(task, answer))
+            if jres.ok:
+                scores = parse_judge_scores(jres.content, rec["score"]["dimensions"])
+                rec["judge"] = {"model": judge_model, "raw": jres.content[:500]}
+                if scores:
+                    rec["score"]["scores"] = scores
+                    rec["score"]["detail"] = "judged"
+                else:
+                    rec["judge"]["error"] = "judge output could not be parsed"
+            else:
+                rec["judge"] = {"model": judge_model, "error": jres.error}
     return rec
 
 
@@ -278,6 +300,7 @@ def _assemble(cfg: RunConfig, server_info: dict, records: list[dict]) -> dict:
         for dim, v in s.items():
             judge_scores.setdefault(dim, []).append(v)
     judge_means = {d: round(statistics.mean(v), 3) for d, v in judge_scores.items() if v}
+    open_unjudged = sum(1 for r in open_tasks if not r.get("score", {}).get("scores"))
 
     return {
         "meta": {
@@ -307,6 +330,7 @@ def _assemble(cfg: RunConfig, server_info: dict, records: list[dict]) -> dict:
             },
             "checker_errors": sum(1 for r in records if r.get("checker_error")),
             "judge_dimension_means": judge_means or None,
+            "open_unjudged": open_unjudged,
         },
     }
 
@@ -334,6 +358,9 @@ def render_markdown(doc: dict) -> str:
                      if all(abs(v - best) < 0.005 for v in judge.values()) else
                      f"- Writing quality (judged by a second model, 0-1): "
                      f"{', '.join(f'{k} {v:.2f}' for k, v in judge.items())}.")
+    if s.get("open_unjudged"):
+        plain.append(f"- {s['open_unjudged']} open task(s) could not be judged — "
+                     "their writing-quality scores are missing, not zero.")
     if s["ttft_ms"]["median"] is not None:
         plain.append(f"- Speed: first word after **{fmt_ms(s['ttft_ms']['median'])}** on average; "
                      f"full answer in {fmt_ms(s['total_ms']['median'])}.")
